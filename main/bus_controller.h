@@ -21,6 +21,9 @@
 #define BUS_DEV_DMA         0x03000     // DMA controller
 #define BUS_DEV_IRQ         0x04000     // Interrupt controller
 #define BUS_DEV_TIMER       0x05000     // Timer device
+#define BUS_DEV_FPU         0x06000     // Floating point coprocessor
+#define BUS_DEV_AUDIO       0x07000     // Sound Blaster 16 audio device
+#define BUS_DEV_VIDEO       0x08000     // Video/GPU framebuffer device
 
 // Network device registers (offset from BUS_DEV_NETWORK)
 #define NET_REG_COMMAND     0x00    // Command register
@@ -114,6 +117,186 @@
 #define DMA_CMD_ABORT       0x02    // Abort transfer
 #define DMA_CMD_M68K_TO_ARM 0x10    // M68K memory -> ARM memory
 #define DMA_CMD_ARM_TO_M68K 0x20    // ARM memory -> M68K memory
+
+// ============================================================================
+// FPU Coprocessor Registers (offset from BUS_DEV_FPU = 0x06000)
+// ============================================================================
+// IEEE 754 double-precision math coprocessor
+// Usage: Write operands, write operation, read result
+// All 64-bit values use two 32-bit registers (HI/LO, big-endian)
+
+#define FPU_REG_OP_A_HI     0x00    // Operand A high 32 bits
+#define FPU_REG_OP_A_LO     0x04    // Operand A low 32 bits
+#define FPU_REG_OP_B_HI     0x08    // Operand B high 32 bits
+#define FPU_REG_OP_B_LO     0x0C    // Operand B low 32 bits
+#define FPU_REG_COMMAND      0x10    // Operation command (triggers execution)
+#define FPU_REG_STATUS       0x14    // Status register
+#define FPU_REG_RESULT_HI    0x18    // Result high 32 bits
+#define FPU_REG_RESULT_LO    0x1C    // Result low 32 bits
+#define FPU_REG_INT_RESULT   0x20    // Integer result (for FTOI, comparisons)
+#define FPU_REG_CONTROL      0x24    // Control register (rounding mode, etc.)
+
+// FPU operations (written to FPU_REG_COMMAND)
+#define FPU_CMD_ADD          0x01    // result = A + B
+#define FPU_CMD_SUB          0x02    // result = A - B
+#define FPU_CMD_MUL          0x03    // result = A * B
+#define FPU_CMD_DIV          0x04    // result = A / B
+#define FPU_CMD_SQRT         0x05    // result = sqrt(A)
+#define FPU_CMD_ABS          0x06    // result = |A|
+#define FPU_CMD_NEG          0x07    // result = -A
+#define FPU_CMD_SIN          0x08    // result = sin(A)
+#define FPU_CMD_COS          0x09    // result = cos(A)
+#define FPU_CMD_TAN          0x0A    // result = tan(A)
+#define FPU_CMD_ATAN         0x0B    // result = atan(A)
+#define FPU_CMD_ATAN2        0x0C    // result = atan2(A, B)
+#define FPU_CMD_LOG          0x0D    // result = log(A) (natural)
+#define FPU_CMD_LOG10        0x0E    // result = log10(A)
+#define FPU_CMD_EXP          0x0F    // result = exp(A)
+#define FPU_CMD_POW          0x10    // result = A^B
+#define FPU_CMD_FMOD         0x11    // result = fmod(A, B)
+#define FPU_CMD_FLOOR        0x12    // result = floor(A)
+#define FPU_CMD_CEIL         0x13    // result = ceil(A)
+#define FPU_CMD_ROUND        0x14    // result = round(A)
+#define FPU_CMD_ITOF         0x15    // result = (double)INT_RESULT  (int to float)
+#define FPU_CMD_FTOI         0x16    // INT_RESULT = (int)A          (float to int)
+#define FPU_CMD_CMP          0x17    // INT_RESULT = compare(A, B) (-1,0,1)
+#define FPU_CMD_ASIN         0x18    // result = asin(A)
+#define FPU_CMD_ACOS         0x19    // result = acos(A)
+#define FPU_CMD_SINH         0x1A    // result = sinh(A)
+#define FPU_CMD_COSH         0x1B    // result = cosh(A)
+#define FPU_CMD_TANH         0x1C    // result = tanh(A)
+#define FPU_CMD_PI           0x20    // result = M_PI
+#define FPU_CMD_E            0x21    // result = M_E
+
+// FPU status bits
+#define FPU_STATUS_READY     0x01    // FPU ready (always 1 on ESP32, instant execution)
+#define FPU_STATUS_ZERO      0x02    // Result is zero
+#define FPU_STATUS_NEG       0x04    // Result is negative
+#define FPU_STATUS_INF       0x08    // Result is infinity
+#define FPU_STATUS_NAN       0x10    // Result is NaN
+#define FPU_STATUS_OVERFLOW  0x20    // Overflow occurred
+#define FPU_STATUS_UNDERFLOW 0x40    // Underflow occurred
+#define FPU_STATUS_DIVZERO   0x80    // Division by zero
+
+// ============================================================================
+// Audio Device Registers (offset from BUS_DEV_AUDIO = 0x07000)
+// ============================================================================
+// Sound Blaster 16 compatible audio output device
+// M68K writes PCM samples to buffer, ESP32 plays via I2S/DAC
+
+#define AUD_REG_COMMAND      0x00    // Audio command register
+#define AUD_REG_STATUS       0x04    // Status register
+#define AUD_REG_FORMAT       0x08    // Audio format (8/16 bit, mono/stereo)
+#define AUD_REG_SAMPLE_RATE  0x0C    // Sample rate in Hz
+#define AUD_REG_VOLUME       0x10    // Master volume (0-255)
+#define AUD_REG_VOLUME_L     0x14    // Left channel volume (0-255)
+#define AUD_REG_VOLUME_R     0x18    // Right channel volume (0-255)
+#define AUD_REG_BUF_ADDR     0x1C    // M68K address of audio DMA buffer
+#define AUD_REG_BUF_SIZE     0x20    // Buffer size in bytes
+#define AUD_REG_BUF_POS      0x24    // Current playback position (read-only)
+#define AUD_REG_CHANNELS     0x28    // Number of channels (1=mono, 2=stereo)
+#define AUD_REG_BITS         0x2C    // Bits per sample (8 or 16)
+#define AUD_REG_IRQ_AT       0x30    // Fire IRQ when buffer reaches this position
+// SB16-style DSP registers (offset 0x100)
+#define AUD_SB_RESET         0x100   // DSP reset (write 1 to reset)
+#define AUD_SB_READ_DATA     0x104   // DSP read data port
+#define AUD_SB_WRITE_CMD     0x108   // DSP write command/data port
+#define AUD_SB_WRITE_STATUS  0x10C   // DSP write status (bit 7 = ready)
+#define AUD_SB_READ_STATUS   0x110   // DSP read status (bit 7 = data available)
+#define AUD_SB_MIXER_ADDR    0x114   // Mixer address port
+#define AUD_SB_MIXER_DATA    0x118   // Mixer data port
+// Audio buffer at offset 0x200 (2KB DMA buffer)
+#define AUD_BUFFER_OFFSET    0x200
+#define AUD_BUFFER_SIZE      2048
+
+// Audio commands
+#define AUD_CMD_INIT         0x01    // Initialize audio device
+#define AUD_CMD_PLAY         0x02    // Start playback
+#define AUD_CMD_STOP         0x03    // Stop playback
+#define AUD_CMD_PAUSE        0x04    // Pause playback
+#define AUD_CMD_RESUME       0x05    // Resume playback
+#define AUD_CMD_SET_FORMAT   0x06    // Set audio format
+#define AUD_CMD_BEEP         0x07    // Play a beep tone (freq in BUF_SIZE, dur in BUF_POS)
+#define AUD_CMD_TONE         0x08    // Play a tone (freq in SAMPLE_RATE, dur in BUF_SIZE)
+
+// Audio format values
+#define AUD_FMT_U8_MONO     0x00    // 8-bit unsigned mono
+#define AUD_FMT_U8_STEREO   0x01    // 8-bit unsigned stereo
+#define AUD_FMT_S16_MONO    0x10    // 16-bit signed mono
+#define AUD_FMT_S16_STEREO  0x11    // 16-bit signed stereo
+
+// Audio status bits
+#define AUD_STATUS_READY     0x01    // Device initialized
+#define AUD_STATUS_PLAYING   0x02    // Currently playing
+#define AUD_STATUS_PAUSED    0x04    // Playback paused
+#define AUD_STATUS_BUF_EMPTY 0x08    // Buffer underrun
+#define AUD_STATUS_IRQ       0x10    // IRQ pending
+#define AUD_STATUS_ERROR     0x80    // Error occurred
+
+// ============================================================================
+// Video/GPU Device Registers (offset from BUS_DEV_VIDEO = 0x08000)
+// ============================================================================
+// Framebuffer-based video device with 2D acceleration
+// Supports text mode, 8-bit indexed, 16-bit RGB565, 24-bit RGB
+
+#define VID_REG_COMMAND      0x00    // Command register
+#define VID_REG_STATUS       0x04    // Status register
+#define VID_REG_MODE         0x08    // Video mode
+#define VID_REG_WIDTH        0x0C    // Screen width in pixels
+#define VID_REG_HEIGHT       0x10    // Screen height in pixels
+#define VID_REG_BPP          0x14    // Bits per pixel
+#define VID_REG_PITCH        0x18    // Bytes per scanline
+#define VID_REG_FB_ADDR      0x1C    // Framebuffer address in M68K RAM
+#define VID_REG_FB_SIZE      0x20    // Framebuffer size in bytes
+#define VID_REG_CURSOR_X     0x24    // Text cursor X position
+#define VID_REG_CURSOR_Y     0x28    // Text cursor Y position
+#define VID_REG_FG_COLOR     0x2C    // Foreground color
+#define VID_REG_BG_COLOR     0x30    // Background color
+#define VID_REG_DRAW_X       0x34    // Draw X coordinate
+#define VID_REG_DRAW_Y       0x38    // Draw Y coordinate
+#define VID_REG_DRAW_W       0x3C    // Draw width
+#define VID_REG_DRAW_H       0x40    // Draw height
+#define VID_REG_DRAW_COLOR   0x44    // Draw color
+#define VID_REG_SRC_X        0x48    // Blit source X
+#define VID_REG_SRC_Y        0x4C    // Blit source Y
+#define VID_REG_FONT_ADDR    0x50    // Font data address in M68K RAM
+#define VID_REG_SCROLL_Y     0x54    // Vertical scroll offset
+#define VID_REG_VBLANK       0x58    // VBlank counter (read-only, increments each frame)
+// Palette registers at offset 0x100 (256 entries × 4 bytes = 1KB)
+#define VID_PALETTE_OFFSET   0x100
+#define VID_PALETTE_SIZE     256
+
+// Video commands
+#define VID_CMD_INIT         0x01    // Initialize video mode
+#define VID_CMD_CLEAR        0x02    // Clear framebuffer
+#define VID_CMD_FLIP         0x03    // Flip/refresh display from framebuffer
+#define VID_CMD_FILL_RECT    0x04    // Fill rectangle (X,Y,W,H,COLOR)
+#define VID_CMD_BLIT         0x05    // Blit rectangle (SRC_X,SRC_Y to X,Y, W×H)
+#define VID_CMD_DRAW_LINE    0x06    // Draw line (X,Y to DRAW_W,DRAW_H, COLOR)
+#define VID_CMD_DRAW_PIXEL   0x07    // Draw single pixel (X,Y,COLOR)
+#define VID_CMD_DRAW_CHAR    0x08    // Draw character at cursor (char in DRAW_COLOR)
+#define VID_CMD_DRAW_TEXT    0x09    // Draw text string from M68K address
+#define VID_CMD_SET_PALETTE  0x0A    // Set palette entry (index in DRAW_X, RGB in DRAW_COLOR)
+#define VID_CMD_SCROLL       0x0B    // Scroll framebuffer by SCROLL_Y pixels
+#define VID_CMD_HLINE        0x0C    // Fast horizontal line
+#define VID_CMD_VLINE        0x0D    // Fast vertical line
+#define VID_CMD_CIRCLE       0x0E    // Draw circle (X,Y center, W=radius)
+#define VID_CMD_FILL_CIRCLE  0x0F    // Fill circle
+
+// Video modes
+#define VID_MODE_TEXT_80x25  0x03    // CGA text mode (80×25, 16 colors)
+#define VID_MODE_320x200x8   0x13    // VGA mode 13h (320×200, 256 colors)
+#define VID_MODE_320x240x16  0x50    // 320×240, RGB565
+#define VID_MODE_480x320x16  0x51    // 480×320, RGB565 (matches SPI LCD)
+#define VID_MODE_640x480x8   0x52    // 640×480, 256 colors
+#define VID_MODE_800x480x16  0x53    // 800×480, RGB565 (matches DSI LCD)
+
+// Video status bits
+#define VID_STATUS_READY     0x01    // Device initialized
+#define VID_STATUS_VBLANK    0x02    // In vertical blanking period
+#define VID_STATUS_BUSY      0x04    // GPU operation in progress
+#define VID_STATUS_TEXT_MODE 0x08    // Text mode active
+#define VID_STATUS_GFX_MODE  0x10    // Graphics mode active
 
 // Bus transaction structure
 typedef struct {

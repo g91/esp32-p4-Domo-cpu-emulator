@@ -139,15 +139,209 @@ typedef struct {
     uint64_t cycles;         // Cycle count at crash
     uint32_t instructions;   // Instructions executed before crash
     char error_msg[256];     // Error message
+    int exception_type;      // Type of exception
 } m68k_crash_context_t;
+
+// Memory region tracking for garbage collection
+typedef struct mem_region {
+    uint32_t start;
+    uint32_t end;
+    bool marked;             // GC mark bit
+    uint64_t last_access;    // Last CPU cycle accessed
+    struct mem_region *next;
+} mem_region_t;
+
+// Exception recovery state
+typedef struct {
+    bool enabled;            // Recovery mode enabled
+    uint32_t timeout_ms;     // Execution timeout in milliseconds
+    uint64_t start_time;     // Execution start time (cycles)
+    uint64_t watchdog_cycles; // Last watchdog reset cycle
+    uint32_t recovery_count; // Number of recoveries performed
+    uint32_t safe_pc;        // Safe PC to return to
+    uint32_t safe_sp;        // Safe SP to return to
+} exception_recovery_t;
 
 static m68k_cpu_t *cpu = NULL;
 static m68k_crash_context_t crash_ctx = {0};
+static exception_recovery_t recovery_state = {
+    .enabled = false,
+    .timeout_ms = 5000,      // 5 second default timeout
+    .recovery_count = 0
+};
+static mem_region_t *gc_regions = NULL;
+static bool watchdog_enabled = true;
+static const uint32_t WATCHDOG_CYCLE_LIMIT = 10000000; // 10M cycles (~167ms @ 60MHz)
 
 // Memory access functions
 // The Motorola 68000 has a 24-bit address bus (A0-A23).
 // The upper 8 bits of any address are physically not connected and must be masked.
 #define M68K_ADDRESS_MASK 0x00FFFFFF
+
+// Forward declarations
+static inline uint8_t read_byte(uint32_t addr);
+static inline uint16_t read_word(uint32_t addr);
+static inline uint32_t read_long(uint32_t addr);
+static inline void write_byte(uint32_t addr, uint8_t value);
+static inline void write_word(uint32_t addr, uint16_t value);
+static inline void write_long(uint32_t addr, uint32_t value);
+
+// ============================================================================
+// Exception Handling and Recovery
+// ============================================================================
+
+static void save_crash_context(uint32_t addr, const char *msg, int exception_type) {
+    crash_ctx.valid = true;
+    crash_ctx.crash_addr = addr;
+    crash_ctx.crash_pc = cpu->pc;
+    crash_ctx.last_pc = cpu->last_pc;
+    crash_ctx.exception_type = exception_type;
+    
+    uint16_t inst = (cpu->last_pc < cpu->ram_size-1) ?
+                    ((cpu->memory[cpu->last_pc] << 8) | cpu->memory[cpu->last_pc + 1]) : 0;
+    crash_ctx.crash_opcode = inst;
+    
+    memcpy(crash_ctx.d, cpu->d, sizeof(crash_ctx.d));
+    memcpy(crash_ctx.a, cpu->a, sizeof(crash_ctx.a));
+    crash_ctx.sr = cpu->sr;
+    crash_ctx.cycles = cpu->cycles;
+    crash_ctx.instructions = cpu->instructions_executed;
+    snprintf(crash_ctx.error_msg, sizeof(crash_ctx.error_msg), "%s", msg);
+}
+
+static bool try_exception_recovery(int exception_type) {
+    if (!recovery_state.enabled) {
+        return false;
+    }
+    
+    recovery_state.recovery_count++;
+    ESP_LOGW(TAG, "Exception recovery attempt #%d", recovery_state.recovery_count);
+    
+    // Too many recoveries = probably infinite crash loop
+    if (recovery_state.recovery_count > 10) {
+        ESP_LOGE(TAG, "Too many recoveries (%d), disabling recovery mode", recovery_state.recovery_count);
+        recovery_state.enabled = false;
+        return false;
+    }
+    
+    // Restore to safe state
+    if (recovery_state.safe_pc != 0) {
+        cpu->pc = recovery_state.safe_pc;
+        cpu->a[7] = recovery_state.safe_sp;
+        cpu->halted = false;
+        cpu->running = true;
+        ESP_LOGI(TAG, "Recovered: PC=0x%08X SP=0x%08X", cpu->pc, cpu->a[7]);
+        return true;
+    }
+    
+    // No safe state - try returning to OS
+    if (cpu->memory[0] != 0 && cpu->memory[4] != 0) {
+        uint32_t reset_sp = read_long(0x000000);
+        uint32_t reset_pc = read_long(0x000004) & M68K_ADDRESS_MASK;
+        
+        if (reset_sp < cpu->ram_size && reset_pc < cpu->ram_size) {
+            cpu->a[7] = reset_sp;
+            cpu->pc = reset_pc;
+            cpu->halted = false;
+            cpu->running = true;
+            ESP_LOGI(TAG, "Recovered to reset vector: PC=0x%08X SP=0x%08X", reset_pc, reset_sp);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+static void check_watchdog(void) {
+    if (!watchdog_enabled) return;
+    
+    // Check for infinite loop (no forward progress)
+    if (cpu->cycles - recovery_state.watchdog_cycles > WATCHDOG_CYCLE_LIMIT) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Watchdog timeout: CPU stuck at PC=0x%08lX", (unsigned long)cpu->pc);
+        ESP_LOGW(TAG, "%s", msg);
+        
+        save_crash_context(cpu->pc, msg, 8); // Watchdog exception
+        
+        if (!try_exception_recovery(8)) {
+            cpu->halted = true;
+        }
+    }
+}
+
+static void check_execution_timeout(void) {
+    if (recovery_state.timeout_ms == 0) return;
+    
+    uint64_t elapsed_cycles = cpu->cycles - recovery_state.start_time;
+    uint64_t timeout_cycles = (uint64_t)recovery_state.timeout_ms * (M68K_CPU_FREQ_MHZ * 1000);
+    
+    if (elapsed_cycles > timeout_cycles) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Execution timeout (%lums) at PC=0x%08lX", 
+                 (unsigned long)recovery_state.timeout_ms, (unsigned long)cpu->pc);
+        ESP_LOGW(TAG, "%s", msg);
+        
+        save_crash_context(cpu->pc, msg, 9); // Timeout exception
+        
+        if (!try_exception_recovery(9)) {
+            cpu->halted = true;
+        }
+    }
+}
+
+// ============================================================================
+// Memory Garbage Collection
+// ============================================================================
+
+static void gc_mark_access(uint32_t addr) {
+    // Mark memory region as accessed
+    for (mem_region_t *r = gc_regions; r != NULL; r = r->next) {
+        if (addr >= r->start && addr < r->end) {
+            r->last_access = cpu->cycles;
+            r->marked = true;
+            return;
+        }
+    }
+}
+
+static void gc_sweep_unused(void) {
+    uint64_t current = cpu->cycles;
+    uint64_t threshold = 60ULL * M68K_CPU_FREQ_MHZ * 1000000; // 60 seconds
+    
+    mem_region_t *prev = NULL;
+    mem_region_t *r = gc_regions;
+    uint32_t freed = 0;
+    
+    while (r != NULL) {
+        if (!r->marked && (current - r->last_access) > threshold) {
+            // Unused for >60 seconds - zero out the region
+            uint32_t size = r->end - r->start;
+            if (r->start < cpu->ram_size && r->end <= cpu->ram_size) {
+                memset(&cpu->memory[r->start], 0, size);
+                freed += size;
+                ESP_LOGI(TAG, "GC: Freed region 0x%08X-0x%08X (%d bytes)", r->start, r->end, size);
+            }
+            
+            // Remove from list
+            mem_region_t *next = r->next;
+            if (prev) {
+                prev->next = next;
+            } else {
+                gc_regions = next;
+            }
+            heap_caps_free(r);
+            r = next;
+        } else {
+            r->marked = false; // Clear mark for next cycle
+            prev = r;
+            r = r->next;
+        }
+    }
+    
+    if (freed > 0) {
+        ESP_LOGI(TAG, "GC: Total freed: %d bytes", freed);
+    }
+}
 
 static inline uint8_t read_byte(uint32_t addr) {
     addr &= M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
@@ -169,11 +363,21 @@ static inline uint8_t read_byte(uint32_t addr) {
 static inline uint16_t read_word(uint32_t addr) {
     addr &= M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
     
+    // Mark GC access
+    gc_mark_access(addr);
+    
     // M68K: Word access to odd address triggers Address Error exception
     if (addr & 1) {
-        ESP_LOGE(TAG, "ADDRESS ERROR: Read word from odd address 0x%08X at PC=0x%08X", addr, cpu->last_pc);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Read word from odd address 0x%08lX at PC=0x%08lX", (unsigned long)addr, (unsigned long)cpu->last_pc);
+        ESP_LOGE(TAG, "%s", msg);
         ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        cpu->halted = true;
+        
+        save_crash_context(addr, msg, 2); // Address error
+        
+        if (!try_exception_recovery(2)) {
+            cpu->halted = true;
+        }
         return 0;
     }
     
@@ -191,18 +395,9 @@ static inline uint16_t read_word(uint32_t addr) {
                     ((cpu->memory[cpu->last_pc] << 8) | cpu->memory[cpu->last_pc + 1]) : 0;
     
     // Save crash context for post-mortem debugging
-    crash_ctx.valid = true;
-    crash_ctx.crash_addr = addr;
-    crash_ctx.crash_pc = cpu->pc;
-    crash_ctx.last_pc = cpu->last_pc;
-    crash_ctx.crash_opcode = inst;
-    memcpy(crash_ctx.d, cpu->d, sizeof(crash_ctx.d));
-    memcpy(crash_ctx.a, cpu->a, sizeof(crash_ctx.a));
-    crash_ctx.sr = cpu->sr;
-    crash_ctx.cycles = cpu->cycles;
-    crash_ctx.instructions = cpu->instructions_executed;
-    snprintf(crash_ctx.error_msg, sizeof(crash_ctx.error_msg),
-             "Read word from invalid address: 0x%08lX", (unsigned long)addr);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Read word from invalid address: 0x%08lX", (unsigned long)addr);
+    save_crash_context(addr, msg, 1); // Bus error
     
     ESP_LOGE(TAG, "FATAL: Read word from invalid address: 0x%08lX (PC corruption detected)", (unsigned long)addr);
     ESP_LOGE(TAG, "  Last PC: 0x%08lX, instruction: 0x%04X", (unsigned long)cpu->last_pc, inst);
@@ -211,19 +406,31 @@ static inline uint16_t read_word(uint32_t addr) {
              (unsigned long)cpu->d[0], (unsigned long)cpu->d[1], (unsigned long)cpu->a[0], (unsigned long)cpu->a[1]);
     ESP_LOGE(TAG, "Crash context saved. Use 'crash' command to examine memory.");
     
-    cpu->halted = true;
-    cpu->running = false;
+    if (!try_exception_recovery(1)) {
+        cpu->halted = true;
+        cpu->running = false;
+    }
     return 0x4E71;  // Return NOP instruction to prevent further damage
 }
 
 static inline uint32_t read_long(uint32_t addr) {
     addr &= M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
     
+    // Mark GC access
+    gc_mark_access(addr);
+    
     // M68K: Long access to odd address triggers Address Error exception
     if (addr & 1) {
-        ESP_LOGE(TAG, "ADDRESS ERROR: Read long from odd address 0x%08X at PC=0x%08X", addr, cpu->last_pc);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Read long from odd address 0x%08lX at PC=0x%08lX", (unsigned long)addr, (unsigned long)cpu->last_pc);
+        ESP_LOGE(TAG, "%s", msg);
         ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        cpu->halted = true;
+        
+        save_crash_context(addr, msg, 2); // Address error
+        
+        if (!try_exception_recovery(2)) {
+            cpu->halted = true;
+        }
         return 0;
     }
     
@@ -262,12 +469,22 @@ static inline void write_byte(uint32_t addr, uint8_t value) {
 static inline void write_word(uint32_t addr, uint16_t value) {
     addr &= M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
     
+    // Mark GC access
+    gc_mark_access(addr);
+    
     // M68K: Word access to odd address triggers Address Error exception
     if (addr & 1) {
-        ESP_LOGE(TAG, "ADDRESS ERROR: Write word to odd address 0x%08X at PC=0x%08X (value=0x%04X)", 
-                 addr, cpu->last_pc, value);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Write word to odd address 0x%08lX at PC=0x%08lX (value=0x%04X)", 
+                 (unsigned long)addr, (unsigned long)cpu->last_pc, value);
+        ESP_LOGE(TAG, "%s", msg);
         ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        cpu->halted = true;
+        
+        save_crash_context(addr, msg, 2); // Address error
+        
+        if (!try_exception_recovery(2)) {
+            cpu->halted = true;
+        }
         return;
     }
     
@@ -289,12 +506,22 @@ static inline void write_word(uint32_t addr, uint16_t value) {
 static inline void write_long(uint32_t addr, uint32_t value) {
     addr &= M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
     
+    // Mark GC access
+    gc_mark_access(addr);
+    
     // M68K: Long access to odd address triggers Address Error exception
     if (addr & 1) {
-        ESP_LOGE(TAG, "ADDRESS ERROR: Write long to odd address 0x%08X at PC=0x%08X (value=0x%08X)", 
-                 addr, cpu->last_pc, value);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Write long to odd address 0x%08lX at PC=0x%08lX (value=0x%08lX)", 
+                 (unsigned long)addr, (unsigned long)cpu->last_pc, (unsigned long)value);
+        ESP_LOGE(TAG, "%s", msg);
         ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        cpu->halted = true;
+        
+        save_crash_context(addr, msg, 2); // Address error
+        
+        if (!try_exception_recovery(2)) {
+            cpu->halted = true;
+        }
         return;
     }
     
@@ -2171,9 +2398,18 @@ static bool execute_instruction(void) {
         return false;
     }
     
+    // Watchdog and timeout checks (every 1000 instructions for efficiency)
+    if ((cpu->instructions_executed % 1000) == 0) {
+        check_watchdog();
+        check_execution_timeout();
+        if (cpu->halted) return false;
+    }
+    
     // Check for odd PC before saving it (catch corruption early)
     if (cpu->pc & 1) {
-        ESP_LOGE(TAG, "FATAL: PC is odd address 0x%08X - cannot execute from odd address!", cpu->pc);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "FATAL: PC is odd address 0x%08lX - cannot execute from odd address!", (unsigned long)cpu->pc);
+        ESP_LOGE(TAG, "%s", msg);
         ESP_LOGE(TAG, "Last valid PC was: 0x%08X", cpu->last_pc);
         ESP_LOGE(TAG, "This typically means:");
         ESP_LOGE(TAG, "  1. RTS popped invalid return address from stack");
@@ -2190,8 +2426,12 @@ static bool execute_instruction(void) {
             }
         }
         
-        cpu->halted = true;
-        cpu->running = false;
+        save_crash_context(cpu->pc, msg, 2); // Address error
+        
+        if (!try_exception_recovery(2)) {
+            cpu->halted = true;
+            cpu->running = false;
+        }
         return false;
     }
     
@@ -2808,11 +3048,26 @@ esp_err_t m68k_init(void) {
     ESP_LOGI(TAG, "  Initial SP: 0x%08X", cpu->a[7]);
     ESP_LOGI(TAG, "  Compatible with: Amiga, Atari ST, Sega Genesis software");
     
+    // Initialize recovery system
+    recovery_state.start_time = 0;
+    recovery_state.watchdog_cycles = 0;
+    recovery_state.recovery_count = 0;
+    m68k_watchdog_enable(true);
+    
+    ESP_LOGI(TAG, "Exception recovery system initialized");
+    ESP_LOGI(TAG, "  Watchdog: enabled (timeout after %d cycles)", WATCHDOG_CYCLE_LIMIT);
+    ESP_LOGI(TAG, "  Execution timeout: %d ms", recovery_state.timeout_ms);
+    
     return ESP_OK;
 }
 
 void m68k_reset(void) {
     if (cpu == NULL) return;
+    
+    // Reset watchdog and timeout tracking
+    recovery_state.start_time = 0;
+    recovery_state.watchdog_cycles = 0;
+    recovery_state.recovery_count = 0;
     
     // Read reset vectors from memory
     uint32_t ssp_raw = read_long(0x000000);
@@ -3092,5 +3347,128 @@ void m68k_set_reg(m68k_register_t reg, uint32_t value) {
         case M68K_REG_SR:
             cpu->sr = (uint16_t)value;
             break;
+    }
+}
+// ============================================================================
+// Exception Recovery API
+// ============================================================================
+
+void m68k_set_exception_recovery(bool enable) {
+    recovery_state.enabled = enable;
+    if (enable) {
+        // Save current state as safe point
+        if (cpu && !cpu->halted) {
+            recovery_state.safe_pc = cpu->pc;
+            recovery_state.safe_sp = cpu->a[7];
+            ESP_LOGI(TAG, "Exception recovery enabled. Safe point: PC=0x%08X SP=0x%08X",
+                     recovery_state.safe_pc, recovery_state.safe_sp);
+        }
+        recovery_state.recovery_count = 0;
+    } else {
+        ESP_LOGI(TAG, "Exception recovery disabled");
+    }
+}
+
+bool m68k_recover_from_crash(void) {
+    if (!cpu) return false;
+    
+    ESP_LOGI(TAG, "Manual crash recovery requested");
+    
+    // Reset crash context
+    crash_ctx.valid = false;
+    
+    // Try to recover
+    if (try_exception_recovery(0)) {
+        ESP_LOGI(TAG, "Recovery successful!");
+        return true;
+    }
+    
+    // Last resort: full CPU reset
+    ESP_LOGW(TAG, "Exception recovery failed, performing full reset");
+    m68k_reset();
+    return true;
+}
+
+void m68k_set_timeout(uint32_t milliseconds) {
+    recovery_state.timeout_ms = milliseconds;
+    if (cpu) {
+        recovery_state.start_time = cpu->cycles;
+    }
+    ESP_LOGI(TAG, "Execution timeout set to %d ms", milliseconds);
+}
+
+// ============================================================================
+// Memory Garbage Collection API
+// ============================================================================
+
+void m68k_gc_mark_region(uint32_t start, uint32_t end) {
+    if (start >= end || end > M68K_RAM_SIZE) {
+        ESP_LOGW(TAG, "Invalid GC region: 0x%08X-0x%08X", start, end);
+        return;
+    }
+    
+    // Add new region to tracking list
+    mem_region_t *region = (mem_region_t *)heap_caps_malloc(sizeof(mem_region_t), MALLOC_CAP_8BIT);
+    if (!region) {
+        ESP_LOGE(TAG, "GC: Failed to allocate region tracker");
+        return;
+    }
+    
+    region->start = start;
+    region->end = end;
+    region->marked = true;
+    region->last_access = cpu ? cpu->cycles : 0;
+    region->next = gc_regions;
+    gc_regions = region;
+    
+    ESP_LOGI(TAG, "GC: Marked region 0x%08X-0x%08X (%d bytes)", start, end, end - start);
+}
+
+void m68k_gc_collect(void) {
+    if (!cpu) return;
+    
+    ESP_LOGI(TAG, "GC: Starting garbage collection...");
+    gc_sweep_unused();
+    ESP_LOGI(TAG, "GC: Collection complete");
+}
+
+void m68k_gc_stats(uint32_t *used, uint32_t *free, uint32_t *regions) {
+    if (!cpu) {
+        if (used) *used = 0;
+        if (free) *free = 0;
+        if (regions) *regions = 0;
+        return;
+    }
+    
+    uint32_t total_tracked = 0;
+    uint32_t region_count = 0;
+    
+    for (mem_region_t *r = gc_regions; r != NULL; r = r->next) {
+        total_tracked += (r->end - r->start);
+        region_count++;
+    }
+    
+    if (used) *used = total_tracked;
+    if (free) *free = M68K_RAM_SIZE - total_tracked;
+    if (regions) *regions = region_count;
+}
+
+// ============================================================================
+// Watchdog API
+// ============================================================================
+
+void m68k_watchdog_reset(void) {
+    if (cpu) {
+        recovery_state.watchdog_cycles = cpu->cycles;
+    }
+}
+
+void m68k_watchdog_enable(bool enable) {
+    watchdog_enabled = enable;
+    if (enable) {
+        m68k_watchdog_reset();
+        ESP_LOGI(TAG, "Watchdog enabled");
+    } else {
+        ESP_LOGI(TAG, "Watchdog disabled");
     }
 }

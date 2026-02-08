@@ -9,6 +9,7 @@
 #include "lcd_console.h"
 #include "ps2_keyboard.h"
 #include <string.h>
+#include <math.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -74,6 +75,399 @@ static struct {
     DIR* open_dirs[MAX_OPEN_DIRS];
 } fs_device;
 
+// ============================================================================
+// FPU Coprocessor State (68881/68882 style via bus I/O)
+// ============================================================================
+static struct {
+    union { double d; uint32_t u32[2]; } op_a;  // Operand A
+    union { double d; uint32_t u32[2]; } op_b;  // Operand B
+    union { double d; uint32_t u32[2]; } result; // Result
+    int32_t int_result;     // Integer result (for FTOI, CMP)
+    uint32_t status;        // Status flags
+    uint32_t control;       // Control/rounding mode
+} fpu_device;
+
+// Helper to update FPU status flags from result
+static void fpu_update_status(double val) {
+    fpu_device.status = FPU_STATUS_READY;
+    if (val == 0.0) fpu_device.status |= FPU_STATUS_ZERO;
+    if (val < 0.0) fpu_device.status |= FPU_STATUS_NEG;
+    if (isinf(val)) fpu_device.status |= FPU_STATUS_INF;
+    if (isnan(val)) fpu_device.status |= FPU_STATUS_NAN;
+}
+
+// Execute FPU operation
+static void fpu_execute(uint32_t cmd) {
+    double a = fpu_device.op_a.d;
+    double b = fpu_device.op_b.d;
+    double r = 0.0;
+    
+    switch (cmd) {
+        case FPU_CMD_ADD:    r = a + b; break;
+        case FPU_CMD_SUB:    r = a - b; break;
+        case FPU_CMD_MUL:    r = a * b; break;
+        case FPU_CMD_DIV:
+            if (b == 0.0) { fpu_device.status = FPU_STATUS_READY | FPU_STATUS_DIVZERO; return; }
+            r = a / b; break;
+        case FPU_CMD_SQRT:   r = sqrt(a); break;
+        case FPU_CMD_ABS:    r = fabs(a); break;
+        case FPU_CMD_NEG:    r = -a; break;
+        case FPU_CMD_SIN:    r = sin(a); break;
+        case FPU_CMD_COS:    r = cos(a); break;
+        case FPU_CMD_TAN:    r = tan(a); break;
+        case FPU_CMD_ATAN:   r = atan(a); break;
+        case FPU_CMD_ATAN2:  r = atan2(a, b); break;
+        case FPU_CMD_LOG:    r = log(a); break;
+        case FPU_CMD_LOG10:  r = log10(a); break;
+        case FPU_CMD_EXP:    r = exp(a); break;
+        case FPU_CMD_POW:    r = pow(a, b); break;
+        case FPU_CMD_FMOD:   r = fmod(a, b); break;
+        case FPU_CMD_FLOOR:  r = floor(a); break;
+        case FPU_CMD_CEIL:   r = ceil(a); break;
+        case FPU_CMD_ROUND:  r = round(a); break;
+        case FPU_CMD_ITOF:   r = (double)fpu_device.int_result; break;
+        case FPU_CMD_FTOI:   fpu_device.int_result = (int32_t)a; fpu_update_status(a); return;
+        case FPU_CMD_CMP:
+            fpu_device.int_result = (a < b) ? -1 : (a > b) ? 1 : 0;
+            fpu_update_status(a - b);
+            return;
+        case FPU_CMD_ASIN:   r = asin(a); break;
+        case FPU_CMD_ACOS:   r = acos(a); break;
+        case FPU_CMD_SINH:   r = sinh(a); break;
+        case FPU_CMD_COSH:   r = cosh(a); break;
+        case FPU_CMD_TANH:   r = tanh(a); break;
+        case FPU_CMD_PI:     r = M_PI; break;
+        case FPU_CMD_E:      r = M_E; break;
+        default:
+            ESP_LOGW(TAG, "FPU: Unknown command 0x%02X", cmd);
+            fpu_device.status = FPU_STATUS_READY;
+            return;
+    }
+    
+    fpu_device.result.d = r;
+    fpu_update_status(r);
+}
+
+// ============================================================================
+// Audio Device State (Sound Blaster 16 compatible)
+// ============================================================================
+static struct {
+    uint32_t command;
+    uint32_t status;
+    uint32_t format;         // Audio format
+    uint32_t sample_rate;    // Sample rate in Hz
+    uint32_t volume;         // Master volume (0-255)
+    uint32_t volume_l;       // Left volume
+    uint32_t volume_r;       // Right volume
+    uint32_t buf_addr;       // M68K DMA buffer address
+    uint32_t buf_size;       // Buffer size
+    uint32_t buf_pos;        // Current playback position
+    uint32_t channels;       // 1=mono, 2=stereo
+    uint32_t bits;           // 8 or 16
+    uint32_t irq_at;         // IRQ position
+    // SB16 DSP state
+    uint8_t dsp_reset;
+    uint8_t dsp_cmd;
+    uint8_t dsp_cmd_len;
+    uint8_t dsp_cmd_needed;
+    uint8_t dsp_in_data[16];
+    uint8_t dsp_in_idx;
+    uint8_t dsp_out_data[64];
+    uint8_t dsp_out_idx;
+    uint8_t dsp_out_used;
+    uint8_t mixer_idx;
+    uint8_t mixer_regs[256];
+    // Audio buffer (for small DMA-less transfers)
+    uint8_t audio_buf[AUD_BUFFER_SIZE];
+    bool playing;
+    bool paused;
+} audio_device;
+
+// SB16 DSP version
+#define SB16_DSP_VERSION_HI  4
+#define SB16_DSP_VERSION_LO  5
+
+static void sb16_dsp_out(uint8_t val) {
+    if (audio_device.dsp_out_used < sizeof(audio_device.dsp_out_data)) {
+        audio_device.dsp_out_data[audio_device.dsp_out_used++] = val;
+    }
+}
+
+static void sb16_dsp_reset(void) {
+    audio_device.dsp_out_used = 0;
+    audio_device.dsp_out_idx = 0;
+    audio_device.dsp_in_idx = 0;
+    audio_device.dsp_cmd = 0;
+    audio_device.dsp_cmd_needed = 0;
+    sb16_dsp_out(0xAA);  // DSP ready signature
+    audio_device.status = AUD_STATUS_READY;
+    ESP_LOGI(TAG, "SB16: DSP reset");
+}
+
+static void sb16_dsp_command(uint8_t cmd) {
+    // Process SB16 DSP commands (subset)
+    switch (cmd) {
+        case 0xD1: // Speaker ON
+            ESP_LOGI(TAG, "SB16: Speaker ON");
+            break;
+        case 0xD3: // Speaker OFF
+            ESP_LOGI(TAG, "SB16: Speaker OFF");
+            break;
+        case 0xD5: // Pause DMA
+            audio_device.paused = true;
+            audio_device.status |= AUD_STATUS_PAUSED;
+            break;
+        case 0xD4: // Resume DMA
+            audio_device.paused = false;
+            audio_device.status &= ~AUD_STATUS_PAUSED;
+            break;
+        case 0xE1: // Get DSP version
+            sb16_dsp_out(SB16_DSP_VERSION_HI);
+            sb16_dsp_out(SB16_DSP_VERSION_LO);
+            break;
+        case 0x40: // Set time constant (1 byte follows)
+            audio_device.dsp_cmd = cmd;
+            audio_device.dsp_cmd_needed = 1;
+            audio_device.dsp_in_idx = 0;
+            return;
+        case 0x41: // Set output sample rate (2 bytes follow)
+        case 0x42: // Set input sample rate
+            audio_device.dsp_cmd = cmd;
+            audio_device.dsp_cmd_needed = 2;
+            audio_device.dsp_in_idx = 0;
+            return;
+        case 0xB0: case 0xB2: case 0xB4: case 0xB6:  // 16-bit DMA
+        case 0xC0: case 0xC2: case 0xC4: case 0xC6:  // 8-bit DMA
+            audio_device.dsp_cmd = cmd;
+            audio_device.dsp_cmd_needed = 3;
+            audio_device.dsp_in_idx = 0;
+            return;
+        case 0xDA: // Exit 8-bit auto-init DMA
+        case 0xD9: // Exit 16-bit auto-init DMA
+            audio_device.playing = false;
+            audio_device.status &= ~AUD_STATUS_PLAYING;
+            break;
+        default:
+            ESP_LOGD(TAG, "SB16: DSP cmd 0x%02X", cmd);
+            break;
+    }
+}
+
+static void sb16_dsp_write_data(uint8_t val) {
+    if (audio_device.dsp_cmd_needed > 0) {
+        audio_device.dsp_in_data[audio_device.dsp_in_idx++] = val;
+        audio_device.dsp_cmd_needed--;
+        if (audio_device.dsp_cmd_needed == 0) {
+            // All parameters received, process command
+            uint8_t cmd = audio_device.dsp_cmd;
+            uint8_t *d = audio_device.dsp_in_data;
+            switch (cmd) {
+                case 0x40: { // Set time constant
+                    int tc = d[0];
+                    audio_device.sample_rate = 1000000 / (256 - tc);
+                    ESP_LOGI(TAG, "SB16: Time constant %d -> %d Hz", tc, audio_device.sample_rate);
+                    break;
+                }
+                case 0x41: case 0x42: { // Set sample rate
+                    audio_device.sample_rate = (d[0] << 8) | d[1];
+                    ESP_LOGI(TAG, "SB16: Sample rate %d Hz", audio_device.sample_rate);
+                    break;
+                }
+                case 0xB0: case 0xB2: case 0xB4: case 0xB6: { // 16-bit DMA
+                    uint8_t mode = d[0];
+                    int len = (d[1] | (d[2] << 8)) + 1;
+                    audio_device.channels = (mode & 0x20) ? 2 : 1;
+                    audio_device.bits = 16;
+                    audio_device.buf_size = len * 2;  // 16-bit samples
+                    audio_device.playing = true;
+                    audio_device.status |= AUD_STATUS_PLAYING;
+                    ESP_LOGI(TAG, "SB16: 16-bit DMA mode=0x%02X len=%d ch=%d", mode, len, audio_device.channels);
+                    break;
+                }
+                case 0xC0: case 0xC2: case 0xC4: case 0xC6: { // 8-bit DMA
+                    uint8_t mode = d[0];
+                    int len = (d[1] | (d[2] << 8)) + 1;
+                    audio_device.channels = (mode & 0x20) ? 2 : 1;
+                    audio_device.bits = 8;
+                    audio_device.buf_size = len;
+                    audio_device.playing = true;
+                    audio_device.status |= AUD_STATUS_PLAYING;
+                    ESP_LOGI(TAG, "SB16: 8-bit DMA mode=0x%02X len=%d ch=%d", mode, len, audio_device.channels);
+                    break;
+                }
+            }
+        }
+        return;
+    }
+    sb16_dsp_command(val);
+}
+
+// ============================================================================
+// Video/GPU Device State
+// ============================================================================
+#define VID_MAX_WIDTH   800
+#define VID_MAX_HEIGHT  480
+static struct {
+    uint32_t command;
+    uint32_t status;
+    uint32_t mode;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;
+    uint32_t pitch;
+    uint32_t fb_addr;       // Framebuffer address in M68K RAM
+    uint32_t fb_size;
+    uint32_t cursor_x;
+    uint32_t cursor_y;
+    uint32_t fg_color;
+    uint32_t bg_color;
+    uint32_t draw_x, draw_y, draw_w, draw_h;
+    uint32_t draw_color;
+    uint32_t src_x, src_y;
+    uint32_t font_addr;
+    uint32_t scroll_y;
+    uint32_t vblank_count;
+    uint32_t palette[VID_PALETTE_SIZE];  // 256 color palette (ARGB)
+    bool initialized;
+} video_device;
+
+// Default VGA 16-color palette
+static const uint32_t default_palette_16[16] = {
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+    0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+    0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+};
+
+// Execute video GPU command
+static void video_execute_command(uint32_t cmd) {
+    switch (cmd) {
+        case VID_CMD_INIT: {
+            // Set up video mode based on video_device.mode
+            uint32_t mode = video_device.mode;
+            switch (mode) {
+                case VID_MODE_TEXT_80x25:
+                    video_device.width = 640; video_device.height = 400;
+                    video_device.bpp = 8; break;
+                case VID_MODE_320x200x8:
+                    video_device.width = 320; video_device.height = 200;
+                    video_device.bpp = 8; break;
+                case VID_MODE_320x240x16:
+                    video_device.width = 320; video_device.height = 240;
+                    video_device.bpp = 16; break;
+                case VID_MODE_480x320x16:
+                    video_device.width = 480; video_device.height = 320;
+                    video_device.bpp = 16; break;
+                case VID_MODE_800x480x16:
+                    video_device.width = 800; video_device.height = 480;
+                    video_device.bpp = 16; break;
+                default:
+                    video_device.width = 320; video_device.height = 200;
+                    video_device.bpp = 8; break;
+            }
+            video_device.pitch = video_device.width * (video_device.bpp / 8);
+            video_device.fb_size = video_device.pitch * video_device.height;
+            // Copy default palette
+            memcpy(video_device.palette, default_palette_16, sizeof(default_palette_16));
+            video_device.initialized = true;
+            video_device.status = VID_STATUS_READY |
+                ((mode == VID_MODE_TEXT_80x25) ? VID_STATUS_TEXT_MODE : VID_STATUS_GFX_MODE);
+            ESP_LOGI(TAG, "Video: Init mode 0x%02X (%dx%dx%d) fb=0x%08X size=%d",
+                     mode, video_device.width, video_device.height, 
+                     video_device.bpp, video_device.fb_addr, video_device.fb_size);
+            break;
+        }
+        case VID_CMD_CLEAR: {
+            // Clear framebuffer in M68K RAM
+            if (video_device.fb_addr && video_device.fb_size) {
+                for (uint32_t i = 0; i < video_device.fb_size; i++) {
+                    m68k_write_memory_8(video_device.fb_addr + i, 0);
+                }
+                ESP_LOGI(TAG, "Video: Clear %d bytes at 0x%08X", video_device.fb_size, video_device.fb_addr);
+            }
+            break;
+        }
+        case VID_CMD_FILL_RECT: {
+            // Fill rectangle in framebuffer
+            uint32_t x = video_device.draw_x;
+            uint32_t y = video_device.draw_y;
+            uint32_t w = video_device.draw_w;
+            uint32_t h = video_device.draw_h;
+            uint32_t color = video_device.draw_color;
+            uint32_t fb = video_device.fb_addr;
+            uint32_t bpp = video_device.bpp;
+            uint32_t pitch = video_device.pitch;
+            
+            if (!fb || !video_device.initialized) break;
+            
+            for (uint32_t row = y; row < y + h && row < video_device.height; row++) {
+                for (uint32_t col = x; col < x + w && col < video_device.width; col++) {
+                    uint32_t offset = row * pitch + col * (bpp / 8);
+                    if (bpp == 8) {
+                        m68k_write_memory_8(fb + offset, color & 0xFF);
+                    } else if (bpp == 16) {
+                        m68k_write_memory_8(fb + offset, (color >> 8) & 0xFF);
+                        m68k_write_memory_8(fb + offset + 1, color & 0xFF);
+                    }
+                }
+            }
+            break;
+        }
+        case VID_CMD_DRAW_PIXEL: {
+            uint32_t x = video_device.draw_x;
+            uint32_t y = video_device.draw_y;
+            uint32_t color = video_device.draw_color;
+            uint32_t fb = video_device.fb_addr;
+            if (!fb || x >= video_device.width || y >= video_device.height) break;
+            uint32_t offset = y * video_device.pitch + x * (video_device.bpp / 8);
+            if (video_device.bpp == 8) {
+                m68k_write_memory_8(fb + offset, color & 0xFF);
+            } else if (video_device.bpp == 16) {
+                m68k_write_memory_8(fb + offset, (color >> 8) & 0xFF);
+                m68k_write_memory_8(fb + offset + 1, color & 0xFF);
+            }
+            break;
+        }
+        case VID_CMD_HLINE: {
+            // Fast horizontal line: Y=draw_y, X1=draw_x, X2=draw_x+draw_w
+            uint32_t y = video_device.draw_y;
+            uint32_t x1 = video_device.draw_x;
+            uint32_t w = video_device.draw_w;
+            uint32_t color = video_device.draw_color;
+            uint32_t fb = video_device.fb_addr;
+            if (!fb || y >= video_device.height) break;
+            for (uint32_t x = x1; x < x1 + w && x < video_device.width; x++) {
+                uint32_t offset = y * video_device.pitch + x * (video_device.bpp / 8);
+                if (video_device.bpp == 8) {
+                    m68k_write_memory_8(fb + offset, color & 0xFF);
+                } else if (video_device.bpp == 16) {
+                    m68k_write_memory_8(fb + offset, (color >> 8) & 0xFF);
+                    m68k_write_memory_8(fb + offset + 1, color & 0xFF);
+                }
+            }
+            break;
+        }
+        case VID_CMD_FLIP: {
+            // Signal to ESP32 LCD driver to refresh from framebuffer
+            // TODO: Actually blit M68K framebuffer to LCD
+            video_device.vblank_count++;
+            ESP_LOGD(TAG, "Video: Flip (vblank=%d)", video_device.vblank_count);
+            break;
+        }
+        case VID_CMD_SET_PALETTE: {
+            // Set palette[draw_x] = draw_color
+            uint32_t idx = video_device.draw_x;
+            if (idx < VID_PALETTE_SIZE) {
+                video_device.palette[idx] = video_device.draw_color;
+            }
+            break;
+        }
+        default:
+            ESP_LOGD(TAG, "Video: Unknown command 0x%02X", cmd);
+            break;
+    }
+}
+
 /* ====== Bus Controller Implementation ====== */
 
 esp_err_t bus_controller_init(void)
@@ -88,6 +482,26 @@ esp_err_t bus_controller_init(void)
     for (int i = 0; i < MAX_OPEN_DIRS; i++) {
         fs_device.open_dirs[i] = NULL;
     }
+    
+    // Initialize FPU coprocessor
+    memset(&fpu_device, 0, sizeof(fpu_device));
+    fpu_device.status = FPU_STATUS_READY;
+    
+    // Initialize audio device (SB16)
+    memset(&audio_device, 0, sizeof(audio_device));
+    audio_device.status = AUD_STATUS_READY;
+    audio_device.sample_rate = 22050;
+    audio_device.channels = 1;
+    audio_device.bits = 8;
+    audio_device.volume = 255;
+    audio_device.volume_l = 255;
+    audio_device.volume_r = 255;
+    
+    // Initialize video device
+    memset(&video_device, 0, sizeof(video_device));
+    memcpy(video_device.palette, default_palette_16, sizeof(default_palette_16));
+    video_device.fg_color = 0xFFFFFF;
+    video_device.bg_color = 0x000000;
     
     // Create mutexes
     socket_mutex = xSemaphoreCreateMutex();
@@ -122,8 +536,13 @@ esp_err_t bus_controller_init(void)
     
     ESP_LOGI(TAG, "Bus controller initialized");
     ESP_LOGI(TAG, "  I/O Base: 0x%08X", BUS_IO_BASE);
-    ESP_LOGI(TAG, "  Network device: 0x%08X", BUS_IO_BASE + BUS_DEV_NETWORK);
-    ESP_LOGI(TAG, "  DMA controller: 0x%08X", BUS_IO_BASE + BUS_DEV_DMA);
+    ESP_LOGI(TAG, "  Network:    0x%08X", BUS_IO_BASE + BUS_DEV_NETWORK);
+    ESP_LOGI(TAG, "  Filesystem: 0x%08X", BUS_IO_BASE + BUS_DEV_FILESYSTEM);
+    ESP_LOGI(TAG, "  Console:    0x%08X", BUS_IO_BASE + BUS_DEV_CONSOLE);
+    ESP_LOGI(TAG, "  DMA:        0x%08X", BUS_IO_BASE + BUS_DEV_DMA);
+    ESP_LOGI(TAG, "  FPU:        0x%08X", BUS_IO_BASE + BUS_DEV_FPU);
+    ESP_LOGI(TAG, "  Audio:      0x%08X", BUS_IO_BASE + BUS_DEV_AUDIO);
+    ESP_LOGI(TAG, "  Video:      0x%08X", BUS_IO_BASE + BUS_DEV_VIDEO);
     
     return ESP_OK;
 }
@@ -207,6 +626,83 @@ uint32_t bus_io_read(uint32_t address, uint8_t size)
         }
         xSemaphoreGive(dma_mutex);
         return value;
+    }
+    
+    // FPU coprocessor reads
+    if (device == BUS_DEV_FPU) {
+        switch (reg) {
+            case FPU_REG_OP_A_HI:    return fpu_device.op_a.u32[0];
+            case FPU_REG_OP_A_LO:    return fpu_device.op_a.u32[1];
+            case FPU_REG_OP_B_HI:    return fpu_device.op_b.u32[0];
+            case FPU_REG_OP_B_LO:    return fpu_device.op_b.u32[1];
+            case FPU_REG_STATUS:     return fpu_device.status;
+            case FPU_REG_RESULT_HI:  return fpu_device.result.u32[0];
+            case FPU_REG_RESULT_LO:  return fpu_device.result.u32[1];
+            case FPU_REG_INT_RESULT: return (uint32_t)fpu_device.int_result;
+            case FPU_REG_CONTROL:    return fpu_device.control;
+        }
+        return 0;
+    }
+    
+    // Audio device reads
+    if (device == BUS_DEV_AUDIO) {
+        switch (reg) {
+            case AUD_REG_COMMAND:     return audio_device.command;
+            case AUD_REG_STATUS:      return audio_device.status;
+            case AUD_REG_FORMAT:      return audio_device.format;
+            case AUD_REG_SAMPLE_RATE: return audio_device.sample_rate;
+            case AUD_REG_VOLUME:      return audio_device.volume;
+            case AUD_REG_VOLUME_L:    return audio_device.volume_l;
+            case AUD_REG_VOLUME_R:    return audio_device.volume_r;
+            case AUD_REG_BUF_ADDR:    return audio_device.buf_addr;
+            case AUD_REG_BUF_SIZE:    return audio_device.buf_size;
+            case AUD_REG_BUF_POS:     return audio_device.buf_pos;
+            case AUD_REG_CHANNELS:    return audio_device.channels;
+            case AUD_REG_BITS:        return audio_device.bits;
+            // SB16 DSP ports
+            case AUD_SB_READ_DATA: {
+                if (audio_device.dsp_out_idx < audio_device.dsp_out_used) {
+                    return audio_device.dsp_out_data[audio_device.dsp_out_idx++];
+                }
+                return 0xFF;
+            }
+            case AUD_SB_WRITE_STATUS:
+                return 0x00;  // Bit 7 clear = ready to write
+            case AUD_SB_READ_STATUS:
+                return (audio_device.dsp_out_idx < audio_device.dsp_out_used) ? 0x80 : 0x00;
+            case AUD_SB_MIXER_DATA:
+                return audio_device.mixer_regs[audio_device.mixer_idx];
+        }
+        // Audio buffer reads
+        if (reg >= AUD_BUFFER_OFFSET && reg < AUD_BUFFER_OFFSET + AUD_BUFFER_SIZE) {
+            return audio_device.audio_buf[reg - AUD_BUFFER_OFFSET];
+        }
+        return 0;
+    }
+    
+    // Video device reads
+    if (device == BUS_DEV_VIDEO) {
+        // Palette reads
+        if (reg >= VID_PALETTE_OFFSET && reg < VID_PALETTE_OFFSET + VID_PALETTE_SIZE * 4) {
+            uint32_t idx = (reg - VID_PALETTE_OFFSET) / 4;
+            return video_device.palette[idx];
+        }
+        switch (reg) {
+            case VID_REG_STATUS:   return video_device.status;
+            case VID_REG_MODE:     return video_device.mode;
+            case VID_REG_WIDTH:    return video_device.width;
+            case VID_REG_HEIGHT:   return video_device.height;
+            case VID_REG_BPP:      return video_device.bpp;
+            case VID_REG_PITCH:    return video_device.pitch;
+            case VID_REG_FB_ADDR:  return video_device.fb_addr;
+            case VID_REG_FB_SIZE:  return video_device.fb_size;
+            case VID_REG_CURSOR_X: return video_device.cursor_x;
+            case VID_REG_CURSOR_Y: return video_device.cursor_y;
+            case VID_REG_FG_COLOR: return video_device.fg_color;
+            case VID_REG_BG_COLOR: return video_device.bg_color;
+            case VID_REG_VBLANK:   return video_device.vblank_count;
+        }
+        return 0;
     }
     
     return 0;
@@ -448,6 +944,125 @@ void bus_io_write(uint32_t address, uint32_t data, uint8_t size)
                 break;
         }
         xSemaphoreGive(dma_mutex);
+    }
+    
+    // FPU coprocessor writes
+    if (device == BUS_DEV_FPU) {
+        switch (reg) {
+            case FPU_REG_OP_A_HI:    fpu_device.op_a.u32[0] = data; break;
+            case FPU_REG_OP_A_LO:    fpu_device.op_a.u32[1] = data; break;
+            case FPU_REG_OP_B_HI:    fpu_device.op_b.u32[0] = data; break;
+            case FPU_REG_OP_B_LO:    fpu_device.op_b.u32[1] = data; break;
+            case FPU_REG_INT_RESULT: fpu_device.int_result = (int32_t)data; break;
+            case FPU_REG_CONTROL:    fpu_device.control = data; break;
+            case FPU_REG_COMMAND:
+                // Writing command triggers execution
+                fpu_execute(data);
+                break;
+        }
+        return;
+    }
+    
+    // Audio device writes
+    if (device == BUS_DEV_AUDIO) {
+        switch (reg) {
+            case AUD_REG_COMMAND:
+                audio_device.command = data;
+                switch (data) {
+                    case AUD_CMD_INIT:
+                        audio_device.status = AUD_STATUS_READY;
+                        ESP_LOGI(TAG, "Audio: Init rate=%d ch=%d bits=%d",
+                                 audio_device.sample_rate, audio_device.channels, audio_device.bits);
+                        break;
+                    case AUD_CMD_PLAY:
+                        audio_device.playing = true;
+                        audio_device.status |= AUD_STATUS_PLAYING;
+                        ESP_LOGI(TAG, "Audio: Play");
+                        break;
+                    case AUD_CMD_STOP:
+                        audio_device.playing = false;
+                        audio_device.paused = false;
+                        audio_device.status &= ~(AUD_STATUS_PLAYING | AUD_STATUS_PAUSED);
+                        audio_device.buf_pos = 0;
+                        ESP_LOGI(TAG, "Audio: Stop");
+                        break;
+                    case AUD_CMD_PAUSE:
+                        audio_device.paused = true;
+                        audio_device.status |= AUD_STATUS_PAUSED;
+                        break;
+                    case AUD_CMD_RESUME:
+                        audio_device.paused = false;
+                        audio_device.status &= ~AUD_STATUS_PAUSED;
+                        break;
+                    case AUD_CMD_BEEP:
+                        ESP_LOGI(TAG, "Audio: Beep freq=%d dur=%d",
+                                 audio_device.buf_size, audio_device.buf_pos);
+                        break;
+                }
+                break;
+            case AUD_REG_FORMAT:      audio_device.format = data; break;
+            case AUD_REG_SAMPLE_RATE: audio_device.sample_rate = data; break;
+            case AUD_REG_VOLUME:      audio_device.volume = data; break;
+            case AUD_REG_VOLUME_L:    audio_device.volume_l = data; break;
+            case AUD_REG_VOLUME_R:    audio_device.volume_r = data; break;
+            case AUD_REG_BUF_ADDR:    audio_device.buf_addr = data; break;
+            case AUD_REG_BUF_SIZE:    audio_device.buf_size = data; break;
+            case AUD_REG_CHANNELS:    audio_device.channels = data; break;
+            case AUD_REG_BITS:        audio_device.bits = data; break;
+            // SB16 DSP ports
+            case AUD_SB_RESET:
+                if (data & 0x01) sb16_dsp_reset();
+                break;
+            case AUD_SB_WRITE_CMD:
+                sb16_dsp_write_data(data & 0xFF);
+                break;
+            case AUD_SB_MIXER_ADDR:
+                audio_device.mixer_idx = data & 0xFF;
+                break;
+            case AUD_SB_MIXER_DATA:
+                audio_device.mixer_regs[audio_device.mixer_idx] = data & 0xFF;
+                break;
+        }
+        // Audio buffer writes
+        if (reg >= AUD_BUFFER_OFFSET && reg < AUD_BUFFER_OFFSET + AUD_BUFFER_SIZE) {
+            audio_device.audio_buf[reg - AUD_BUFFER_OFFSET] = data & 0xFF;
+        }
+        return;
+    }
+    
+    // Video device writes
+    if (device == BUS_DEV_VIDEO) {
+        // Palette writes
+        if (reg >= VID_PALETTE_OFFSET && reg < VID_PALETTE_OFFSET + VID_PALETTE_SIZE * 4) {
+            uint32_t idx = (reg - VID_PALETTE_OFFSET) / 4;
+            video_device.palette[idx] = data;
+            return;
+        }
+        switch (reg) {
+            case VID_REG_COMMAND:
+                video_device.command = data;
+                video_execute_command(data);
+                break;
+            case VID_REG_MODE:      video_device.mode = data; break;
+            case VID_REG_WIDTH:     video_device.width = data; break;
+            case VID_REG_HEIGHT:    video_device.height = data; break;
+            case VID_REG_BPP:       video_device.bpp = data; break;
+            case VID_REG_FB_ADDR:   video_device.fb_addr = data; break;
+            case VID_REG_CURSOR_X:  video_device.cursor_x = data; break;
+            case VID_REG_CURSOR_Y:  video_device.cursor_y = data; break;
+            case VID_REG_FG_COLOR:  video_device.fg_color = data; break;
+            case VID_REG_BG_COLOR:  video_device.bg_color = data; break;
+            case VID_REG_DRAW_X:    video_device.draw_x = data; break;
+            case VID_REG_DRAW_Y:    video_device.draw_y = data; break;
+            case VID_REG_DRAW_W:    video_device.draw_w = data; break;
+            case VID_REG_DRAW_H:    video_device.draw_h = data; break;
+            case VID_REG_DRAW_COLOR: video_device.draw_color = data; break;
+            case VID_REG_SRC_X:     video_device.src_x = data; break;
+            case VID_REG_SRC_Y:     video_device.src_y = data; break;
+            case VID_REG_FONT_ADDR: video_device.font_addr = data; break;
+            case VID_REG_SCROLL_Y:  video_device.scroll_y = data; break;
+        }
+        return;
     }
 }
 
