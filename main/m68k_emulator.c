@@ -157,6 +157,7 @@ typedef struct {
     uint32_t timeout_ms;     // Execution timeout in milliseconds
     uint64_t start_time;     // Execution start time (cycles)
     uint64_t watchdog_cycles; // Last watchdog reset cycle
+    uint32_t watchdog_pc;    // PC at last watchdog reset
     uint32_t recovery_count; // Number of recoveries performed
     uint32_t safe_pc;        // Safe PC to return to
     uint32_t safe_sp;        // Safe SP to return to
@@ -167,7 +168,8 @@ static m68k_crash_context_t crash_ctx = {0};
 static exception_recovery_t recovery_state = {
     .enabled = false,
     .timeout_ms = 5000,      // 5 second default timeout
-    .recovery_count = 0
+    .recovery_count = 0,
+    .watchdog_pc = 0
 };
 static mem_region_t *gc_regions = NULL;
 static bool watchdog_enabled = true;
@@ -255,17 +257,23 @@ static bool try_exception_recovery(int exception_type) {
 static void check_watchdog(void) {
     if (!watchdog_enabled) return;
     
-    // Check for infinite loop (no forward progress)
+    // Check for true infinite loop: same PC for extended period
     if (cpu->cycles - recovery_state.watchdog_cycles > WATCHDOG_CYCLE_LIMIT) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Watchdog timeout: CPU stuck at PC=0x%08lX", (unsigned long)cpu->pc);
-        ESP_LOGW(TAG, "%s", msg);
-        
-        save_crash_context(cpu->pc, msg, 8); // Watchdog exception
-        
-        if (!try_exception_recovery(8)) {
-            cpu->halted = true;
+        // Only trigger if PC hasn't changed at all
+        if (cpu->pc == recovery_state.watchdog_pc) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Watchdog timeout: CPU stuck at PC=0x%08lX", (unsigned long)cpu->pc);
+            ESP_LOGW(TAG, "%s", msg);
+            
+            save_crash_context(cpu->pc, msg, 8); // Watchdog exception
+            
+            if (!try_exception_recovery(8)) {
+                cpu->halted = true;
+            }
         }
+        // PC changed, so reset watchdog
+        recovery_state.watchdog_cycles = cpu->cycles;
+        recovery_state.watchdog_pc = cpu->pc;
     }
 }
 
@@ -2398,7 +2406,11 @@ static bool execute_instruction(void) {
         return false;
     }
     
-    // Watchdog and timeout checks (every 1000 instructions for efficiency)
+    // Reset watchdog on every instruction (track PC changes)
+    recovery_state.watchdog_cycles = cpu->cycles;
+    recovery_state.watchdog_pc = cpu->pc;
+    
+    // Timeout check only (every 1000 instructions for efficiency)
     if ((cpu->instructions_executed % 1000) == 0) {
         check_watchdog();
         check_execution_timeout();
@@ -3067,6 +3079,7 @@ void m68k_reset(void) {
     // Reset watchdog and timeout tracking
     recovery_state.start_time = 0;
     recovery_state.watchdog_cycles = 0;
+    recovery_state.watchdog_pc = 0;
     recovery_state.recovery_count = 0;
     
     // Read reset vectors from memory
@@ -3460,6 +3473,7 @@ void m68k_gc_stats(uint32_t *used, uint32_t *free, uint32_t *regions) {
 void m68k_watchdog_reset(void) {
     if (cpu) {
         recovery_state.watchdog_cycles = cpu->cycles;
+        recovery_state.watchdog_pc = cpu->pc;
     }
 }
 
