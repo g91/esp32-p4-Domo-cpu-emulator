@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "lwip/sockets.h"
+#include "ping/ping_sock.h"
 
 static const char *TAG = "BusCtrl";
 
@@ -56,10 +57,12 @@ static struct {
 // Filesystem device state
 #define MAX_OPEN_FILES 8
 #define MAX_OPEN_DIRS 4
+#define FS_BUF_SIZE 512
 static struct {
-    char path_buf[256];      // Path string buffer
+    char path_buf[256];      // Path string buffer (at reg 0x100)
+    uint8_t data_buf[FS_BUF_SIZE];  // Data buffer (at reg 0x200)
     uint32_t command;        // Current command
-    uint32_t status;         // Status register
+    uint32_t status;         // Status register (0=busy, 1=success, 2+=error)
     int32_t result;          // Result/error code
     uint32_t file_size;      // File size (for stat/read)
     uint32_t file_pos;       // File position
@@ -158,17 +161,20 @@ uint32_t bus_io_read(uint32_t address, uint8_t size)
         return 0;
     }
     
-    // Filesystem device
+    // Filesystem device - reads
+    // Protocol: STATUS at 0x004 (0=busy, 1=success, 2+=error)
+    //   FS_BUFFER at 0x200+ served from local data_buf[]
     if (device == BUS_DEV_FILESYSTEM) {
+        // FS_BUFFER reads (0x200-0x3FF) - return data from local buffer
+        if (reg >= 0x200 && reg < 0x200 + FS_BUF_SIZE) {
+            return fs_device.data_buf[reg - 0x200];
+        }
+        
         switch (reg) {
-            case FS_REG_STATUS:      return fs_device.status;
-            case FS_REG_RESULT:      return fs_device.result;
-            case FS_REG_FILE_SIZE:   return fs_device.file_size;
-            case FS_REG_FILE_POS:    return fs_device.file_pos;
-            case FS_REG_DATA_PTR:    return fs_device.data_ptr;
-            case FS_REG_DATA_LEN:    return fs_device.data_len;
-            case FS_REG_FILE_MODE:   return fs_device.file_mode;
-            case FS_REG_FILE_HANDLE: return fs_device.file_handle;
+            case 0x00: return fs_device.command;
+            case 0x04: return fs_device.status;    // FS_STATUS
+            case 0x08: return fs_device.data_len;   // FS_SIZE
+            case 0x0C: return fs_device.file_pos;   // FS_OFFSET
         }
         return 0;
     }
@@ -218,139 +224,149 @@ void bus_io_write(uint32_t address, uint32_t data, uint8_t size)
     uint32_t reg = offset & 0x00FFF;
     
     // Filesystem device (0x00F01000)
+    // Protocol: M68K OS writes path to 0x100+, then command to 0x000
+    //   STATUS (0x004): 0 = busy/processing, 1 = success, 2+ = error
+    //   Results go to FS_BUFFER at offset 0x200 (newline-separated for READDIR)
     if (device == BUS_DEV_FILESYSTEM) {
-        // Path buffer writes (0x100-0x1FF)
-        if (reg >= FS_REG_PATH_BUF && reg < FS_REG_PATH_BUF + 256) {
-            int idx = reg - FS_REG_PATH_BUF;
+        // Path/filename buffer writes (0x100-0x1FF)
+        if (reg >= 0x100 && reg < 0x200) {
+            int idx = reg - 0x100;
             fs_device.path_buf[idx] = (char)(data & 0xFF);
             return;
         }
         
+        // FS_BUFFER writes (0x200-0x3FF) - OS writes data here for FS_CMD_WRITE
+        if (reg >= 0x200 && reg < 0x200 + FS_BUF_SIZE) {
+            fs_device.data_buf[reg - 0x200] = (uint8_t)(data & 0xFF);
+            return;
+        }
+        
         switch (reg) {
-            case FS_REG_COMMAND:
+            case 0x00:  // FS_COMMAND
                 fs_device.command = data;
-                // Execute filesystem command immediately
+                fs_device.status = 0;  // 0 = busy (OS polls until non-zero)
+                ESP_LOGI(TAG, "FS: Command 0x%02X, path='%s'", data, fs_device.path_buf);
+                
                 switch (data) {
-                    case FS_CMD_OPENDIR: {
-                        // Find free directory slot
-                        int dir_idx = -1;
-                        for (int i = 0; i < MAX_OPEN_DIRS; i++) {
-                            if (fs_device.open_dirs[i] == NULL) {
-                                dir_idx = i;
-                                break;
-                            }
-                        }
-                        if (dir_idx < 0) {
-                            fs_device.status = FS_STATUS_ERROR;
-                            fs_device.result = -1;
-                            ESP_LOGW(TAG, "FS: No free directory slots");
-                            break;
+                    case FS_CMD_READDIR: {
+                        // List directory: read all entries into local data_buf as newline-separated names
+                        // M68K OS reads result from FS_BUFFER (I/O offset 0x200+) via bus_io_read
+                        char full_path[300];
+                        if (fs_device.path_buf[0] == '/' && fs_device.path_buf[1] == '\0') {
+                            snprintf(full_path, sizeof(full_path), "/sdcard");
+                        } else {
+                            snprintf(full_path, sizeof(full_path), "/sdcard%s", fs_device.path_buf);
                         }
                         
-                        // Open directory
-                        char full_path[300];
-                        snprintf(full_path, sizeof(full_path), "/sdcard%s", fs_device.path_buf);
                         DIR* dir = opendir(full_path);
                         if (dir) {
-                            fs_device.open_dirs[dir_idx] = dir;
-                            fs_device.file_handle = dir_idx;
-                            fs_device.status = FS_STATUS_OK;
-                            fs_device.result = dir_idx;
-                            ESP_LOGI(TAG, "FS: opendir('%s') -> '%s' = handle %d", 
-                                     fs_device.path_buf, full_path, dir_idx);
+                            // Write filenames into local buffer (served via bus_io_read at offset 0x200)
+                            memset(fs_device.data_buf, 0, FS_BUF_SIZE);
+                            uint32_t buf_offset = 0;
+                            uint32_t max_buf = FS_BUF_SIZE - 1;  // Leave room for null terminator
                             
-                            // Debug: List what's actually in the directory
-                            struct dirent *test_entry;
+                            struct dirent *entry;
                             int count = 0;
-                            ESP_LOGI(TAG, "FS: Directory contents:");
-                            while ((test_entry = readdir(dir)) != NULL && count < 10) {
-                                ESP_LOGI(TAG, "  - %s", test_entry->d_name);
-                                count++;
-                            }
-                            if (count == 0) {
-                                ESP_LOGI(TAG, "  (empty directory)");
-                            }
-                            rewinddir(dir); // Reset for M68K to read
-                        } else {
-                            fs_device.status = FS_STATUS_NOTFOUND;
-                            fs_device.result = -1;
-                            ESP_LOGW(TAG, "FS: opendir('%s') -> '%s' failed: %s", 
-                                     fs_device.path_buf, full_path, strerror(errno));
-                        }
-                        break;
-                    }
-                    
-                    case FS_CMD_READDIR: {
-                        uint32_t dir_idx = fs_device.file_handle;
-                        ESP_LOGI(TAG, "FS: readdir() called with handle %d", dir_idx);
-                        
-                        if (dir_idx >= MAX_OPEN_DIRS || fs_device.open_dirs[dir_idx] == NULL) {
-                            fs_device.status = FS_STATUS_ERROR;
-                            fs_device.result = -1;
-                            ESP_LOGW(TAG, "FS: readdir() - invalid handle %d", dir_idx);
-                            break;
-                        }
-                        
-                        struct dirent *entry = readdir(fs_device.open_dirs[dir_idx]);
-                        if (entry) {
-                            // Copy filename to M68K memory via data_ptr
-                            if (fs_device.data_ptr != 0) {
+                            while ((entry = readdir(dir)) != NULL) {
                                 const char *name = entry->d_name;
-                                uint32_t addr = fs_device.data_ptr;
-                                ESP_LOGI(TAG, "FS: readdir() copying '%s' to M68K addr 0x%08X", 
-                                         name, addr);
-                                for (int i = 0; i < 256 && name[i]; i++) {
-                                    m68k_write_memory_8(addr + i, name[i]);
-                                }
-                                m68k_write_memory_8(addr + 255, 0); // Null terminate
-                            } else {
-                                ESP_LOGW(TAG, "FS: readdir() - data_ptr is NULL!");
+                                int name_len = strlen(name);
+                                
+                                if (buf_offset + name_len + 1 >= max_buf) break;
+                                
+                                memcpy(&fs_device.data_buf[buf_offset], name, name_len);
+                                buf_offset += name_len;
+                                fs_device.data_buf[buf_offset++] = '\n';
+                                count++;
+                                ESP_LOGI(TAG, "FS: [%d] %s", count, name);
                             }
-                            fs_device.status = FS_STATUS_OK;
-                            fs_device.result = 0;
-                            ESP_LOGI(TAG, "FS: readdir() = '%s' (OK)", entry->d_name);
+                            // Null-terminate
+                            fs_device.data_buf[buf_offset] = 0;
+                            fs_device.data_len = buf_offset;
+                            closedir(dir);
+                            
+                            fs_device.status = 1;  // 1 = success
+                            ESP_LOGI(TAG, "FS: READDIR '%s' success: %d entries, %d bytes", full_path, count, buf_offset);
                         } else {
-                            fs_device.status = FS_STATUS_EOF;
-                            fs_device.result = -1;
-                            ESP_LOGI(TAG, "FS: readdir() = EOF");
+                            memset(fs_device.data_buf, 0, FS_BUF_SIZE);
+                            fs_device.status = 2;  // error
+                            ESP_LOGW(TAG, "FS: READDIR failed on '%s': %s", full_path, strerror(errno));
                         }
                         break;
                     }
                     
-                    case FS_CMD_CLOSEDIR: {
-                        uint32_t dir_idx = fs_device.file_handle;
-                        if (dir_idx < MAX_OPEN_DIRS && fs_device.open_dirs[dir_idx]) {
-                            closedir(fs_device.open_dirs[dir_idx]);
-                            fs_device.open_dirs[dir_idx] = NULL;
-                            fs_device.status = FS_STATUS_OK;
-                            fs_device.result = 0;
-                            ESP_LOGI(TAG, "FS: closedir(%d)", dir_idx);
+                    case FS_CMD_OPEN: {
+                        char full_path[300];
+                        snprintf(full_path, sizeof(full_path), "/sdcard%s%s",
+                                 fs_device.path_buf[0] == '/' ? "" : "/",
+                                 fs_device.path_buf);
+                        
+                        int slot = -1;
+                        for (int i = 0; i < MAX_OPEN_FILES; i++) {
+                            if (fs_device.open_files[i] == NULL) { slot = i; break; }
+                        }
+                        
+                        if (slot >= 0) {
+                            FILE *f = fopen(full_path, "rb");
+                            if (f) {
+                                fs_device.open_files[slot] = f;
+                                fs_device.file_handle = slot;
+                                fseek(f, 0, SEEK_END);
+                                fs_device.file_size = ftell(f);
+                                fseek(f, 0, SEEK_SET);
+                                fs_device.status = 1;
+                                ESP_LOGI(TAG, "FS: OPEN '%s' handle=%d size=%d", full_path, slot, fs_device.file_size);
+                            } else {
+                                fs_device.status = 2;
+                                ESP_LOGW(TAG, "FS: OPEN '%s' failed: %s", full_path, strerror(errno));
+                            }
                         } else {
-                            fs_device.status = FS_STATUS_ERROR;
-                            fs_device.result = -1;
+                            fs_device.status = 2;
+                            ESP_LOGW(TAG, "FS: OPEN - no free slots");
+                        }
+                        break;
+                    }
+                    
+                    case FS_CMD_CLOSE: {
+                        if (fs_device.file_handle < MAX_OPEN_FILES && 
+                            fs_device.open_files[fs_device.file_handle]) {
+                            fclose(fs_device.open_files[fs_device.file_handle]);
+                            fs_device.open_files[fs_device.file_handle] = NULL;
+                            ESP_LOGI(TAG, "FS: CLOSE handle=%d", fs_device.file_handle);
+                        }
+                        fs_device.status = 1;
+                        break;
+                    }
+                    
+                    case FS_CMD_READ: {
+                        if (fs_device.file_handle < MAX_OPEN_FILES && 
+                            fs_device.open_files[fs_device.file_handle]) {
+                            uint32_t to_read = fs_device.data_len;
+                            if (to_read > FS_BUF_SIZE) to_read = FS_BUF_SIZE;
+                            
+                            memset(fs_device.data_buf, 0, FS_BUF_SIZE);
+                            size_t got = fread(fs_device.data_buf, 1, to_read, 
+                                              fs_device.open_files[fs_device.file_handle]);
+                            fs_device.data_len = got;
+                            fs_device.status = 1;
+                            ESP_LOGI(TAG, "FS: READ %d bytes", got);
+                        } else {
+                            fs_device.status = 2;
                         }
                         break;
                     }
                     
                     default:
-                        ESP_LOGW(TAG, "FS: Unsupported command 0x%02X", data);
-                        fs_device.status = FS_STATUS_ERROR;
-                        fs_device.result = -1;
+                        ESP_LOGW(TAG, "FS: Unknown command 0x%02X", data);
+                        fs_device.status = 2;  // error
                         break;
                 }
                 break;
                 
-            case FS_REG_DATA_PTR:
-                fs_device.data_ptr = data;
-                break;
-            case FS_REG_DATA_LEN:
+            case 0x08:  // FS_SIZE
                 fs_device.data_len = data;
                 break;
-            case FS_REG_FILE_MODE:
-                fs_device.file_mode = data;
-                break;
-            case FS_REG_FILE_HANDLE:
-                fs_device.file_handle = data;
+            case 0x0C:  // FS_OFFSET
+                fs_device.file_pos = data;
                 break;
         }
         return;
@@ -482,6 +498,35 @@ static void free_socket(int id)
         memset(&socket_table[id], 0, sizeof(bus_socket_t));
         xSemaphoreGive(socket_mutex);
     }
+}
+
+// Ping callback data
+// Ping callback data
+typedef struct {
+    int success_count;
+    uint32_t total_time;
+} ping_result_t;
+
+// Ping callbacks (must be static C functions, not lambdas)
+static void ping_on_success(esp_ping_handle_t hdl, void *args) {
+    ping_result_t *result = (ping_result_t*)args;
+    if (!result) return;
+    
+    uint32_t elapsed;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
+    result->success_count++;
+    result->total_time += elapsed;
+    ESP_LOGI(TAG, "Ping reply: time=%d ms", elapsed);
+}
+
+static void ping_on_timeout(esp_ping_handle_t hdl, void *args) {
+    ESP_LOGW(TAG, "Ping timeout");
+}
+
+static void ping_on_end(esp_ping_handle_t hdl, void *args) {
+    ping_result_t *result = (ping_result_t*)args;
+    if (!result) return;
+    ESP_LOGI(TAG, "Ping complete: %d replies received", result->success_count);
 }
 
 int32_t network_process_command(network_op_t *op)
@@ -687,6 +732,60 @@ int32_t network_process_command(network_op_t *op)
             // Close socket
             free_socket(op->socket_id);
             return 0;
+        }
+        
+        case NET_CMD_PING: {
+            // ICMP ping - M68K sends IP already in network byte order (big-endian)
+            // 192.168.0.90 = 0xC0A8005A (no conversion needed)
+            uint32_t ip_addr = op->addr_ip;
+            
+            ESP_LOGI(TAG, "Ping command: IP=0x%08X = %d.%d.%d.%d",
+                     ip_addr,
+                     (ip_addr >> 24) & 0xFF, (ip_addr >> 16) & 0xFF,
+                     (ip_addr >> 8) & 0xFF, ip_addr & 0xFF);
+            
+            esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
+            ping_config.target_addr.u_addr.ip4.addr = ip_addr;
+            ping_config.target_addr.type = IPADDR_TYPE_V4;
+            ping_config.count = (op->data_len > 0) ? op->data_len : 4;
+            ping_config.interval_ms = 1000;
+            ping_config.timeout_ms = 5000;
+            
+            // Initialize result structure explicitly
+            ping_result_t result;
+            memset(&result, 0, sizeof(result));
+            
+            esp_ping_callbacks_t cbs;
+            memset(&cbs, 0, sizeof(cbs));
+            cbs.on_ping_success = ping_on_success;
+            cbs.on_ping_timeout = ping_on_timeout;
+            cbs.on_ping_end = ping_on_end;
+            cbs.cb_args = &result;
+            
+            esp_ping_handle_t ping;
+            esp_err_t ret = esp_ping_new_session(&ping_config, &cbs, &ping);
+            if (ret == ESP_OK) {
+                esp_ping_start(ping);
+                vTaskDelay(pdMS_TO_TICKS(ping_config.count * 1200));  // Wait for all pings
+                esp_ping_stop(ping);
+                
+                uint32_t transmitted, received, total_time_ms;
+                esp_ping_get_profile(ping, ESP_PING_PROF_REQUEST, &transmitted, sizeof(transmitted));
+                esp_ping_get_profile(ping, ESP_PING_PROF_REPLY, &received, sizeof(received));
+                esp_ping_get_profile(ping, ESP_PING_PROF_TIMEGAP, &total_time_ms, sizeof(total_time_ms));
+                
+                esp_ping_delete_session(ping);
+                
+                ESP_LOGI(TAG, "Ping statistics: %d/%d received, avg_time=%d ms",
+                         received, transmitted, result.success_count > 0 ? result.total_time / result.success_count : 0);
+                
+                if (result.success_count > 0) {
+                    return result.total_time / result.success_count;  // Average RTT in ms
+                } else {
+                    return -1;  // No replies
+                }
+            }
+            return -2;  // Ping session creation failed
         }
         
         case NET_CMD_GETINFO: {

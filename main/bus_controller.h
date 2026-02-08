@@ -48,6 +48,7 @@
 #define NET_CMD_GETSOCKOPT  0x0B    // Get socket option
 #define NET_CMD_SETSOCKOPT  0x0C    // Set socket option
 #define NET_CMD_GETINFO     0x0D    // Get network info (IP, DNS, etc.)
+#define NET_CMD_PING        0x0E    // ICMP ping
 
 // Socket types
 #define NET_SOCK_STREAM     0x01    // TCP
@@ -77,29 +78,29 @@
 #define FS_REG_FILE_MODE    0x208   // File open mode
 #define FS_REG_FILE_HANDLE  0x20C   // File handle (index)
 
-// Filesystem commands
-#define FS_CMD_OPENDIR      0x07    // Open directory
-#define FS_CMD_READDIR      0x08    // Read next directory entry
-#define FS_CMD_CLOSEDIR     0x09    // Close directory
+// Filesystem commands (matching m68k_os.cpp definitions)
 #define FS_CMD_OPEN         0x01    // Open file
 #define FS_CMD_CLOSE        0x02    // Close file
 #define FS_CMD_READ         0x03    // Read from file
 #define FS_CMD_WRITE        0x04    // Write to file
 #define FS_CMD_SEEK         0x05    // Seek file position
 #define FS_CMD_STAT         0x06    // Get file info
-#define FS_CMD_DELETE       0x0A    // Delete file
-#define FS_CMD_MKDIR        0x0B    // Create directory
-#define FS_CMD_RMDIR        0x0C    // Remove directory
+#define FS_CMD_READDIR      0x07    // List directory contents
+#define FS_CMD_MKDIR        0x08    // Create directory
+#define FS_CMD_REMOVE       0x09    // Delete file/directory
 
-// Filesystem status codes
-#define FS_STATUS_OK        0x00    // Success
-#define FS_STATUS_ERROR     0x01    // Generic error
-#define FS_STATUS_NOTFOUND  0x02    // File not found
-#define FS_STATUS_EXISTS    0x03    // File already exists
-#define FS_STATUS_NOSPACE   0x04    // No space left
-#define FS_STATUS_ISDIR     0x05    // Is a directory
-#define FS_STATUS_NOTDIR    0x06    // Not a directory
-#define FS_STATUS_EOF       0x07    // End of file/directory
+// Filesystem status flags (bit fields)
+#define FS_STATUS_READY     0x01    // Device ready
+#define FS_STATUS_COMPLETE  0x02    // Command complete
+#define FS_STATUS_ERROR     0x04    // Error occurred
+#define FS_STATUS_EOF       0x08    // End of file/directory
+
+// Filesystem result codes (separate from status)
+#define FS_RESULT_OK        0       // Success
+#define FS_RESULT_ERROR     -1      // Generic error
+#define FS_RESULT_NOTFOUND  -2      // File not found
+#define FS_RESULT_EXISTS    -3      // File already exists
+#define FS_RESULT_NOSPACE   -4      // No space left
 
 // DMA controller registers
 #define DMA_REG_CONTROL     0x00    // DMA control

@@ -30,6 +30,32 @@ extern "C" void _start(void);
 
 #define NET_COMMAND     ((volatile unsigned long *)0x00F00000)
 #define NET_STATUS      ((volatile unsigned long *)0x00F00004)
+#define NET_SOCKET_ID   ((volatile unsigned long *)0x00F00008)
+#define NET_ADDR_TYPE   ((volatile unsigned long *)0x00F0000C)
+#define NET_ADDR_IP     ((volatile unsigned long *)0x00F00010)
+#define NET_ADDR_PORT   ((volatile unsigned long *)0x00F00014)
+#define NET_DATA_LEN    ((volatile unsigned long *)0x00F00018)
+#define NET_DATA_PTR    ((volatile unsigned long *)0x00F0001C)
+#define NET_FLAGS       ((volatile unsigned long *)0x00F00020)
+#define NET_RESULT      ((volatile unsigned long *)0x00F00024)
+
+// Network commands
+#define NET_CMD_SOCKET      0x01
+#define NET_CMD_BIND        0x02
+#define NET_CMD_LISTEN      0x03
+#define NET_CMD_ACCEPT      0x04
+#define NET_CMD_CONNECT     0x05
+#define NET_CMD_SEND        0x06
+#define NET_CMD_RECV        0x07
+#define NET_CMD_SENDTO      0x08
+#define NET_CMD_RECVFROM    0x09
+#define NET_CMD_CLOSE       0x0A
+#define NET_CMD_PING        0x0E
+
+// Socket types
+#define SOCK_STREAM         0x01
+#define SOCK_DGRAM          0x02
+#define SOCK_RAW            0x03
 
 #define TIMER_COUNT     ((volatile unsigned long *)0x00F05000)
 #define TIMER_CONTROL   ((volatile unsigned long *)0x00F05004)
@@ -550,6 +576,7 @@ private:
         Console::println("  poke      - Write byte to memory");
         Console::println("  peek      - Read byte from memory");
         Console::println("  run       - Execute program at address");
+        Console::println("  ping      - Ping a host (requires WiFi)");
         Console::println("  uptime    - Show system uptime");
         Console::println("  reboot    - Reboot the system");
         Console::println("");
@@ -842,6 +869,66 @@ private:
         Console::println("Returned from subroutine.");
     }
     
+    static void cmd_ping() {
+        if (argc < 2) {
+            Console::println("Usage: ping <hostname or IP>");
+            Console::println("Example: ping 8.8.8.8");
+            return;
+        }
+        
+        const char *host = argv[1];
+        Console::printf("Pinging %s...\n", host);
+        
+        // Parse IP address (simple format: xxx.xxx.xxx.xxx)
+        unsigned long ip = 0;
+        int parts[4] = {0, 0, 0, 0};
+        int part_idx = 0;
+        const char *p = host;
+        
+        while (*p && part_idx < 4) {
+            if (*p >= '0' && *p <= '9') {
+                parts[part_idx] = parts[part_idx] * 10 + (*p - '0');
+            } else if (*p == '.') {
+                part_idx++;
+            } else {
+                Console::println("Invalid IP address format");
+                return;
+            }
+            p++;
+        }
+        
+        // Build IP address (network byte order for display, host order for sending)
+        ip = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+        
+        // Set up ping parameters
+        *NET_ADDR_IP = ip;
+        *NET_DATA_LEN = 4;  // Number of pings
+        
+        // Issue ping command
+        *NET_COMMAND = NET_CMD_PING;
+        
+        // Wait for completion (with timeout)
+        int timeout = 10000;  // ~10 seconds
+        while (*NET_STATUS == 0 && timeout > 0) {
+            timeout--;
+            for (volatile int i = 0; i < 100; i++);  // Small delay
+        }
+        
+        if (timeout == 0) {
+            Console::println("Ping timeout - no response");
+            return;
+        }
+        
+        // Check result
+        int result = (int)*NET_RESULT;
+        if (result >= 0) {
+            Console::printf("Reply from %d.%d.%d.%d: %d ms\n",
+                           parts[0], parts[1], parts[2], parts[3], result);
+        } else {
+            Console::printf("Ping failed (error %d)\n", result);
+        }
+    }
+    
     static void cmd_uptime() {
         unsigned long ticks = *TIMER_COUNT;
         unsigned long secs = ticks / 1000;
@@ -914,6 +1001,9 @@ public:
         }
         else if (strcmp(argv[0], "run") == 0 || strcmp(argv[0], "exec") == 0) {
             cmd_run();
+        }
+        else if (strcmp(argv[0], "ping") == 0) {
+            cmd_ping();
         }
         else if (strcmp(argv[0], "uptime") == 0) {
             cmd_uptime();
