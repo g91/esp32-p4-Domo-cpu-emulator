@@ -6,6 +6,9 @@ dependencies:
   espressif/esp_hosted:
     version: "1.4.*"
     
+  espressif/usb_host_hid:
+    version: "*"
+
   ## Required IDF version
   idf:
     version: ">=5.0.0"

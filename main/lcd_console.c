@@ -686,6 +686,10 @@ void lcd_console_putchar(char c)
         
         // Re-render entire screen and flip
         render_screen();
+        // Always flip on scroll
+        if (!console->defer_flip) {
+            lcd_console_flip_buffer();
+        }
     } else {
         // Only update affected lines in buffer
         if (old_row != console->cursor_row) {
@@ -693,9 +697,10 @@ void lcd_console_putchar(char c)
         }
         render_line(console->cursor_row);
         
-        // Flip to display for instant update (DOS-style)
-        // Note: This happens on EVERY character, but SPI delay in flip prevents queue overflow
-        lcd_console_flip_buffer();
+        // Only flip if not in batch mode
+        if (!console->defer_flip) {
+            lcd_console_flip_buffer();
+        }
     }
     
     xSemaphoreGive(console->mutex);

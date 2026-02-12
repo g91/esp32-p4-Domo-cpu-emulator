@@ -1,0 +1,1443 @@
+/**
+ * @file i8086_pc.c
+ * @brief IBM PC/XT Hardware Emulation Implementation
+ *
+ * Provides PIC 8259, PIT 8253, keyboard controller, RTC/CMOS,
+ * CGA text mode, and port I/O routing for the i8086 PC emulator.
+ */
+
+#include "i8086_pc.h"
+#include "video_card.h"
+#include <string.h>
+#include <time.h>
+#include "esp_log.h"
+
+static const char *TAG = "i86_pc";
+
+// ============================================================================
+// PIC 8259A Implementation
+// ============================================================================
+
+void pic_init(pic8259_t *pic) {
+    memset(pic, 0, sizeof(pic8259_t));
+    pic->IMR = 0xFF;           // All interrupts masked
+    pic->vector_base = 0x08;   // Default: IRQ0 → INT 08h
+    pic->auto_eoi = false;
+}
+
+void pic_write(pic8259_t *pic, uint8_t port, uint8_t value) {
+    if ((port & 1) == 0) {
+        // Even port (0x20/0xA0) — command register
+        if (value & 0x10) {
+            // ICW1 - start initialization
+            pic->ICW1 = value;
+            pic->icw_step = 1;
+            pic->init_mode = true;
+            pic->IMR = 0x00;
+            pic->ISR = 0x00;
+            pic->IRR = 0x00;
+            pic->read_isr = false;
+        } else if (value & 0x08) {
+            // OCW3
+            if (value & 0x02) {
+                pic->read_isr = (value & 0x01) ? true : false;
+            }
+        } else {
+            // OCW2 - EOI commands
+            if ((value & 0xE0) == 0x20) {
+                // Non-specific EOI
+                for (int i = 0; i < 8; i++) {
+                    int check = (pic->priority + i + 1) & 7;
+                    if (pic->ISR & (1 << check)) {
+                        pic->ISR &= ~(1 << check);
+                        break;
+                    }
+                }
+            } else if ((value & 0xE0) == 0x60) {
+                // Specific EOI
+                int irq = value & 0x07;
+                pic->ISR &= ~(1 << irq);
+            }
+        }
+    } else {
+        // Odd port (0x21/0xA1) — data register
+        if (pic->init_mode) {
+            switch (pic->icw_step) {
+                case 1: // ICW2 - vector base
+                    pic->ICW2 = value;
+                    pic->vector_base = value & 0xF8;
+                    pic->icw_step = 2;
+                    break;
+                case 2: // ICW3 - cascade
+                    pic->ICW3 = value;
+                    if (pic->ICW1 & 0x01) {
+                        pic->icw_step = 3;  // Need ICW4
+                    } else {
+                        pic->init_mode = false;
+                    }
+                    break;
+                case 3: // ICW4
+                    pic->ICW4 = value;
+                    pic->auto_eoi = (value & 0x02) ? true : false;
+                    pic->init_mode = false;
+                    break;
+            }
+        } else {
+            // OCW1 - IMR
+            pic->IMR = value;
+        }
+    }
+}
+
+uint8_t pic_read(pic8259_t *pic, uint8_t port) {
+    if ((port & 1) == 0) {
+        // Command port — read IRR or ISR based on OCW3
+        return pic->read_isr ? pic->ISR : pic->IRR;
+    } else {
+        // Data port — read IMR
+        return pic->IMR;
+    }
+}
+
+void pic_signal_irq(pic8259_t *pic, int irq) {
+    if (irq >= 0 && irq < 8) {
+        pic->IRR |= (1 << irq);
+    }
+}
+
+void pic_clear_irq(pic8259_t *pic, int irq) {
+    if (irq >= 0 && irq < 8) {
+        pic->IRR &= ~(1 << irq);
+    }
+}
+
+int pic_get_pending_irq(pic8259_t *pic) {
+    uint8_t pending = pic->IRR & ~pic->IMR & ~pic->ISR;
+    if (pending == 0) return -1;
+
+    // Find highest-priority pending IRQ
+    for (int i = 0; i < 8; i++) {
+        int check = (pic->priority + i + 1) & 7;
+        if (pending & (1 << check)) {
+            return check;
+        }
+    }
+    return -1;
+}
+
+void pic_acknowledge(pic8259_t *pic, int irq) {
+    if (irq >= 0 && irq < 8) {
+        pic->IRR &= ~(1 << irq);
+        if (!pic->auto_eoi) {
+            pic->ISR |= (1 << irq);
+        }
+    }
+}
+
+// ============================================================================
+// PIT 8253 Implementation
+// ============================================================================
+
+void pit_init(pit8253_t *pit) {
+    memset(pit, 0, sizeof(pit8253_t));
+    for (int i = 0; i < 3; i++) {
+        pit->ch[i].gate = true;    // Gates tied high on IBM PC (ch0, ch1)
+        pit->ch[i].output = true;
+        pit->ch[i].reload = 0xFFFF;
+        pit->ch[i].counter = 0xFFFF;
+        pit->ch[i].mode = PIT_MODE_SQUAREWAVE;
+    }
+}
+
+void pit_write(pit8253_t *pit, uint8_t port, uint8_t value) {
+    if (port == 0x43) {
+        // Control word
+        int channel = (value >> 6) & 3;
+        if (channel == 3) {
+            // Read-back command (8254 only, ignore for 8253)
+            return;
+        }
+        int rw = (value >> 4) & 3;
+        int mode = (value >> 1) & 7;
+        int bcd = value & 1;
+
+        if (rw == 0) {
+            // Latch command
+            pit->ch[channel].latch = pit->ch[channel].counter;
+            pit->ch[channel].latched = true;
+            pit->ch[channel].read_lsb = 0;
+        } else {
+            pit->ch[channel].rw_mode = rw;
+            pit->ch[channel].mode = (mode > 5) ? (mode - 4) : mode;
+            pit->ch[channel].bcd = bcd;
+            pit->ch[channel].write_lsb = 0;
+            pit->ch[channel].loaded = false;
+            pit->ch[channel].output = (mode == PIT_MODE_INTERRUPT) ? false : true;
+        }
+    } else {
+        // Channel data (ports 0x40-0x42)
+        int ch = port & 3;
+        if (ch >= 3) return;
+        pit_channel_t *c = &pit->ch[ch];
+
+        switch (c->rw_mode) {
+            case 1: // LSB only
+                c->reload = value;
+                if (c->reload == 0) c->reload = 0x10000; // 0 means 65536
+                c->counter = c->reload;
+                c->loaded = true;
+                break;
+            case 2: // MSB only
+                c->reload = (uint16_t)value << 8;
+                if (c->reload == 0) c->reload = 0x10000;
+                c->counter = c->reload;
+                c->loaded = true;
+                break;
+            case 3: // LSB then MSB
+                if (c->write_lsb == 0) {
+                    c->reload = (c->reload & 0xFF00) | value;
+                    c->write_lsb = 1;
+                } else {
+                    c->reload = (c->reload & 0x00FF) | ((uint16_t)value << 8);
+                    if (c->reload == 0) c->reload = 0xFFFF;
+                    c->counter = c->reload;
+                    c->write_lsb = 0;
+                    c->loaded = true;
+                }
+                break;
+        }
+    }
+}
+
+uint8_t pit_read(pit8253_t *pit, uint8_t port) {
+    if (port == 0x43) return 0; // Control word not readable
+
+    int ch = port & 3;
+    if (ch >= 3) return 0;
+    pit_channel_t *c = &pit->ch[ch];
+
+    uint16_t val = c->latched ? c->latch : c->counter;
+
+    switch (c->rw_mode) {
+        case 1: // LSB only
+            c->latched = false;
+            return val & 0xFF;
+        case 2: // MSB only
+            c->latched = false;
+            return (val >> 8) & 0xFF;
+        case 3: // LSB then MSB
+            if (c->read_lsb == 0) {
+                c->read_lsb = 1;
+                return val & 0xFF;
+            } else {
+                c->read_lsb = 0;
+                c->latched = false;
+                return (val >> 8) & 0xFF;
+            }
+        default:
+            return val & 0xFF;
+    }
+}
+
+void pit_tick(pit8253_t *pit, int ticks) {
+    for (int ch = 0; ch < 3; ch++) {
+        pit_channel_t *c = &pit->ch[ch];
+        if (!c->gate || !c->loaded) continue;
+
+        for (int t = 0; t < ticks; t++) {
+            if (c->counter == 0) {
+                c->counter = c->reload;
+                // Trigger output change based on mode
+                switch (c->mode) {
+                    case PIT_MODE_INTERRUPT:
+                        c->output = true;
+                        break;
+                    case PIT_MODE_RATEGEN:
+                        c->output = true;   // Brief pulse
+                        break;
+                    case PIT_MODE_SQUAREWAVE:
+                        c->output = !c->output;
+                        break;
+                    default:
+                        c->output = true;
+                        break;
+                }
+            } else {
+                c->counter--;
+                if (c->mode == PIT_MODE_RATEGEN && c->counter == 1) {
+                    c->output = false; // Low for one tick before reload
+                }
+            }
+        }
+    }
+}
+
+bool pit_get_output(pit8253_t *pit, int channel) {
+    if (channel < 0 || channel >= 3) return false;
+    return pit->ch[channel].output;
+}
+
+// ============================================================================
+// Keyboard Controller Implementation
+// ============================================================================
+
+void kbd_init(kbd_ctrl_t *kbd) {
+    memset(kbd, 0, sizeof(kbd_ctrl_t));
+    kbd->enabled = true;
+    kbd->scancode_set = 1;  // XT scancode set
+    kbd->status = 0x1C;     // System flag set, self-test passed
+}
+
+void kbd_write_data(kbd_ctrl_t *kbd, uint8_t value) {
+    // Commands sent to keyboard
+    switch (value) {
+        case 0xED: // Set LEDs
+            // Next byte will be LED status
+            break;
+        case 0xF0: // Set scancode set
+            break;
+        case 0xF4: // Enable keyboard
+            kbd->enabled = true;
+            // Send ACK
+            kbd_push_scancode(kbd, 0xFA);
+            break;
+        case 0xF5: // Disable keyboard
+            kbd->enabled = false;
+            kbd_push_scancode(kbd, 0xFA);
+            break;
+        case 0xFF: // Reset
+            kbd->enabled = true;
+            kbd_push_scancode(kbd, 0xFA); // ACK
+            kbd_push_scancode(kbd, 0xAA); // Self-test passed
+            break;
+        default:
+            // ACK for unknown commands
+            kbd_push_scancode(kbd, 0xFA);
+            break;
+    }
+}
+
+void kbd_write_cmd(kbd_ctrl_t *kbd, uint8_t value) {
+    kbd->command = value;
+    switch (value) {
+        case 0x20: // Read command byte
+            kbd_push_scancode(kbd, 0x65); // Default: translate, SYS, IRQ enabled
+            break;
+        case 0x60: // Write command byte (next data write)
+            break;
+        case 0xAA: // Self-test
+            kbd_push_scancode(kbd, 0x55); // Test passed
+            break;
+        case 0xAB: // Interface test
+            kbd_push_scancode(kbd, 0x00); // No error
+            break;
+        case 0xAD: // Disable keyboard
+            kbd->enabled = false;
+            break;
+        case 0xAE: // Enable keyboard
+            kbd->enabled = true;
+            break;
+        case 0xD1: // Write output port (next data write)
+            break;
+        case 0xFE: // Pulse reset line (system reset request)
+            break;
+        default:
+            break;
+    }
+}
+
+uint8_t kbd_read_data(kbd_ctrl_t *kbd) {
+    if (kbd->head != kbd->tail) {
+        uint8_t data = kbd->buffer[kbd->tail];
+        kbd->tail = (kbd->tail + 1) % KBD_BUFFER_SIZE;
+        // Update status: clear OBF if buffer empty
+        if (kbd->head == kbd->tail) {
+            kbd->status &= ~0x01;  // Clear output buffer full
+        }
+        return data;
+    }
+    return 0;
+}
+
+uint8_t kbd_read_status(kbd_ctrl_t *kbd) {
+    return kbd->status;
+}
+
+bool kbd_has_data(kbd_ctrl_t *kbd) {
+    return kbd->head != kbd->tail;
+}
+
+void kbd_push_scancode(kbd_ctrl_t *kbd, uint8_t scancode) {
+    int next = (kbd->head + 1) % KBD_BUFFER_SIZE;
+    if (next != kbd->tail) {
+        kbd->buffer[kbd->head] = scancode;
+        kbd->head = next;
+        kbd->status |= 0x01;  // Set output buffer full
+    }
+}
+
+void kbd_push_key(kbd_ctrl_t *kbd, uint8_t scancode, uint8_t ascii) {
+    // Push make code
+    kbd_push_scancode(kbd, scancode);
+    (void)ascii;  // ASCII tracked in BIOS keyboard buffer
+}
+
+// ============================================================================
+// RTC / CMOS Implementation
+// ============================================================================
+
+static uint8_t to_bcd(uint8_t value) {
+    return ((value / 10) << 4) | (value % 10);
+}
+
+void rtc_init(rtc_t *rtc) {
+    memset(rtc, 0, sizeof(rtc_t));
+    rtc->nmi_enabled = true;
+
+    // Set default CMOS values
+    rtc->cmos[0x0A] = 0x26;  // Status register A: 32.768kHz, 1024Hz periodic
+    rtc->cmos[0x0B] = 0x02;  // Status register B: 24h mode, BCD
+    rtc->cmos[0x0C] = 0x00;  // Status register C
+    rtc->cmos[0x0D] = 0x80;  // Status register D: valid RAM/battery
+
+    // Equipment byte
+    rtc->cmos[0x14] = 0x2D;  // 1 floppy, 80x25 CGA, 640KB
+
+    // Base memory: 640KB
+    rtc->cmos[0x15] = 0x80;  // Low byte: 640 & 0xFF
+    rtc->cmos[0x16] = 0x02;  // High byte: 640 >> 8
+
+    // Extended memory: 0 (no extended on XT)
+    rtc->cmos[0x17] = 0x00;
+    rtc->cmos[0x18] = 0x00;
+
+    // HD type
+    rtc->cmos[0x12] = 0x00;  // No HD by default
+    rtc->cmos[0x19] = 0x00;
+    rtc->cmos[0x1A] = 0x00;
+
+    // Boot from floppy first, then HD
+    rtc->cmos[0x2D] = 0x20;
+
+    // Floppy type (A: = 3.5" 1.44MB)
+    rtc->cmos[0x10] = 0x40;  // Drive A = type 4 (1.44M)
+
+    rtc_update_time(rtc);
+}
+
+void rtc_write(rtc_t *rtc, uint8_t port, uint8_t value) {
+    if (port == 0x70) {
+        rtc->reg_select = value & 0x7F;
+        rtc->nmi_enabled = !(value & 0x80);
+    } else if (port == 0x71) {
+        if (rtc->reg_select < CMOS_SIZE) {
+            rtc->cmos[rtc->reg_select] = value;
+        }
+    }
+}
+
+uint8_t rtc_read(rtc_t *rtc, uint8_t port) {
+    if (port == 0x70) {
+        return rtc->reg_select;
+    } else if (port == 0x71) {
+        if (rtc->reg_select < 0x0A) {
+            // Reading time registers — update first
+            rtc_update_time(rtc);
+        }
+        if (rtc->reg_select == 0x0C) {
+            // Reading Status C clears interrupt flags
+            uint8_t val = rtc->cmos[0x0C];
+            rtc->cmos[0x0C] = 0;
+            return val;
+        }
+        if (rtc->reg_select < CMOS_SIZE) {
+            return rtc->cmos[rtc->reg_select];
+        }
+    }
+    return 0xFF;
+}
+
+void rtc_update_time(rtc_t *rtc) {
+    time_t now;
+    time(&now);
+    struct tm *t = localtime(&now);
+    if (!t) return;
+
+    // Always BCD format (status B bit 2 = 0)
+    rtc->cmos[0x00] = to_bcd(t->tm_sec);
+    rtc->cmos[0x02] = to_bcd(t->tm_min);
+    rtc->cmos[0x04] = to_bcd(t->tm_hour);
+    rtc->cmos[0x06] = to_bcd(t->tm_wday + 1);
+    rtc->cmos[0x07] = to_bcd(t->tm_mday);
+    rtc->cmos[0x08] = to_bcd(t->tm_mon + 1);
+    rtc->cmos[0x09] = to_bcd(t->tm_year % 100);
+    rtc->cmos[0x32] = to_bcd(19 + t->tm_year / 100);  // Century
+}
+
+// ============================================================================
+// CGA Video Controller Implementation
+// ============================================================================
+
+void cga_init(cga_t *cga) {
+    memset(cga, 0, sizeof(cga_t));
+    cga->mode_reg = 0x29;        // 80x25, text mode
+    cga->color_reg = 0x00;
+    cga->cursor_start = 6;
+    cga->cursor_end = 7;
+    cga->cursor_visible = true;
+    cga->needs_refresh = true;
+
+    // Default CRTC values for 80x25 text mode 3
+    cga->crtc[0x00] = 0x71;  // Horizontal total
+    cga->crtc[0x01] = 0x50;  // Horizontal displayed (80)
+    cga->crtc[0x02] = 0x5A;  // H sync position
+    cga->crtc[0x03] = 0x0A;  // H sync width
+    cga->crtc[0x04] = 0x1F;  // Vertical total
+    cga->crtc[0x05] = 0x06;  // V total adjust
+    cga->crtc[0x06] = 0x19;  // Vertical displayed (25)
+    cga->crtc[0x07] = 0x1C;  // V sync position
+    cga->crtc[0x08] = 0x02;  // Interlace mode
+    cga->crtc[0x09] = 0x07;  // Max scan line (8 scanlines per char row)
+    cga->crtc[0x0A] = 0x06;  // Cursor start
+    cga->crtc[0x0B] = 0x07;  // Cursor end
+}
+
+void cga_write(cga_t *cga, uint16_t port, uint8_t value) {
+    switch (port) {
+        case 0x3D4: // CRTC address register
+            cga->crtc_reg_select = value & 0x1F;
+            break;
+
+        case 0x3D5: // CRTC data register
+            if (cga->crtc_reg_select < 18) {
+                cga->crtc[cga->crtc_reg_select] = value;
+
+                switch (cga->crtc_reg_select) {
+                    case 0x0A: // Cursor start
+                        cga->cursor_start = value & 0x1F;
+                        cga->cursor_visible = !(value & 0x20);
+                        break;
+                    case 0x0B: // Cursor end
+                        cga->cursor_end = value & 0x1F;
+                        break;
+                    case 0x0C: // Start address high
+                        cga->mem_offset = (cga->mem_offset & 0x00FF) | ((uint16_t)value << 8);
+                        cga->needs_refresh = true;
+                        break;
+                    case 0x0D: // Start address low
+                        cga->mem_offset = (cga->mem_offset & 0xFF00) | value;
+                        cga->needs_refresh = true;
+                        break;
+                    case 0x0E: // Cursor location high
+                        cga->cursor_pos = (cga->cursor_pos & 0x00FF) | ((uint16_t)value << 8);
+                        break;
+                    case 0x0F: // Cursor location low
+                        cga->cursor_pos = (cga->cursor_pos & 0xFF00) | value;
+                        break;
+                }
+            }
+            break;
+
+        case 0x3D8: // Mode control register
+            cga->mode_reg = value;
+            cga->needs_refresh = true;
+            break;
+
+        case 0x3D9: // Color select register
+            cga->color_reg = value;
+            cga->needs_refresh = true;
+            break;
+
+        // Hercules compatible registers (stub)
+        case 0x3B4:
+        case 0x3B5:
+        case 0x3B8:
+        case 0x3BF:
+            break;
+
+        default:
+            break;
+    }
+}
+
+uint8_t cga_read(cga_t *cga, uint16_t port) {
+    switch (port) {
+        case 0x3D4:
+            return cga->crtc_reg_select;
+
+        case 0x3D5:
+            if (cga->crtc_reg_select < 18)
+                return cga->crtc[cga->crtc_reg_select];
+            return 0;
+
+        case 0x3DA: // Status register
+        {
+            // Toggle vsync and hsync bits to keep programs happy
+            cga->vsync_count++;
+            uint8_t status = 0;
+            if (cga->vsync_count & 0x01) status |= 0x01;  // Display enable
+            if (cga->vsync_count & 0x08) status |= 0x08;  // Vertical retrace
+            return status;
+        }
+
+        case 0x3BA: // Hercules status (same pattern)
+        {
+            cga->vsync_count++;
+            uint8_t status = 0;
+            if (cga->vsync_count & 0x01) status |= 0x01;
+            if (cga->vsync_count & 0x80) status |= 0x80;
+            return status;
+        }
+
+        default:
+            return 0xFF;
+    }
+}
+
+uint16_t cga_get_cursor_offset(cga_t *cga) {
+    return cga->cursor_pos;
+}
+
+// ============================================================================
+// PC System Integration
+// ============================================================================
+
+void pc_hw_init(pc_hardware_t *hw, uint32_t cpu_freq_mhz) {
+    memset(hw, 0, sizeof(pc_hardware_t));
+
+    pic_init(&hw->pic_master);
+    pic_init(&hw->pic_slave);
+
+    // Set standard vector bases
+    hw->pic_master.vector_base = 0x08;  // IRQ 0-7 → INT 08h-0Fh
+    hw->pic_slave.vector_base = 0x70;   // IRQ 8-15 → INT 70h-77h
+
+    pit_init(&hw->pit);
+    kbd_init(&hw->keyboard);
+    rtc_init(&hw->rtc);
+    cga_init(&hw->cga);
+
+    hw->port_b = 0x00;
+    hw->speaker_enabled = false;
+    hw->speaker_freq = 0;
+
+    // PIT runs at 1.193182 MHz. CPU runs at cpu_freq_mhz MHz.
+    // We need to tick PIT once per (cpu_freq / pit_freq) CPU cycles
+    // For 8 MHz CPU: ~6.7 CPU cycles per PIT tick
+    // We'll tick PIT in batches to avoid overhead
+    hw->cycles_per_pit_tick = (cpu_freq_mhz * 1000000) / PIT_CLOCK_FREQ;
+    if (hw->cycles_per_pit_tick == 0) hw->cycles_per_pit_tick = 7; // ~8MHz default
+
+    // Refresh LCD every ~33ms (30 fps) worth of instructions
+    // At 8 MHz, that's ~264,000 instructions per frame
+    hw->refresh_interval = cpu_freq_mhz * 33000;
+    if (hw->refresh_interval == 0) hw->refresh_interval = 264000;
+
+    hw->initialized = true;
+
+    ESP_LOGI(TAG, "PC hardware initialized: PIC, PIT, KBD, RTC, CGA");
+    ESP_LOGD(TAG, "  PIT tick every %lu CPU cycles", (unsigned long)hw->cycles_per_pit_tick);
+}
+
+void pc_hw_write_port(pc_hardware_t *hw, uint16_t port, uint8_t value) {
+    switch (port) {
+        // PIC master (IRQ 0-7)
+        case 0x20: case 0x21:
+            pic_write(&hw->pic_master, port & 1, value);
+            break;
+
+        // PIC slave (IRQ 8-15)
+        case 0xA0: case 0xA1:
+            pic_write(&hw->pic_slave, port & 1, value);
+            break;
+
+        // PIT (timer)
+        case 0x40: case 0x41: case 0x42: case 0x43:
+            pit_write(&hw->pit, port - 0x40, value);
+            break;
+
+        // Keyboard data
+        case 0x60:
+            kbd_write_data(&hw->keyboard, value);
+            break;
+
+        // System control port B
+        case 0x61:
+            hw->port_b = value;
+            // Bit 0: Timer 2 gate (speaker frequency)
+            hw->pit.ch[2].gate = (value & 0x01) ? true : false;
+            // Bit 1: Speaker data enable
+            hw->speaker_enabled = (value & 0x02) ? true : false;
+            break;
+
+        // Keyboard command
+        case 0x64:
+            kbd_write_cmd(&hw->keyboard, value);
+            break;
+
+        // RTC / CMOS
+        case 0x70: case 0x71:
+            rtc_write(&hw->rtc, port, value);
+            break;
+
+        // CGA / Video
+        case 0x3B4: case 0x3B5: case 0x3B8: case 0x3BF:
+        case 0x3D4: case 0x3D5: case 0x3D8: case 0x3D9:
+            cga_write(&hw->cga, port, value);
+            break;
+
+        // DMA controller (stubs)
+        case 0x00: case 0x01: case 0x02: case 0x03:
+        case 0x04: case 0x05: case 0x06: case 0x07:
+        case 0x08: case 0x09: case 0x0A: case 0x0B:
+        case 0x0C: case 0x0D: case 0x0E: case 0x0F:
+            break;  // DMA - ignore
+
+        // DMA page registers
+        case 0x81: case 0x82: case 0x83: case 0x87:
+            hw->dma_page[(port - 0x80) & 7] = value;
+            break;
+
+        // Game port (joystick)
+        case 0x201:
+            break;
+
+        // NMI mask: on AT-class PCs, controlled via bit 7 of port 0x70
+        // Port 0xA0 handled by PIC slave above
+
+        default:
+            ESP_LOGD(TAG, "OUT %04X = %02X (unhandled)", port, value);
+            break;
+    }
+}
+
+uint8_t pc_hw_read_port(pc_hardware_t *hw, uint16_t port) {
+    switch (port) {
+        // PIC master
+        case 0x20: case 0x21:
+            return pic_read(&hw->pic_master, port & 1);
+
+        // PIC slave
+        case 0xA0: case 0xA1:
+            return pic_read(&hw->pic_slave, port & 1);
+
+        // PIT
+        case 0x40: case 0x41: case 0x42:
+            return pit_read(&hw->pit, port - 0x40);
+
+        // Keyboard data
+        case 0x60:
+            return kbd_read_data(&hw->keyboard);
+
+        // System control port B
+        case 0x61: {
+            uint8_t val = hw->port_b & 0x0F;
+            // Bit 4: toggles with RAM refresh (timer 1 output)
+            val |= (hw->pit.ch[1].output ? 0x10 : 0x00);
+            // Bit 5: timer 2 output
+            val |= (hw->pit.ch[2].output ? 0x20 : 0x00);
+            return val;
+        }
+
+        // Keyboard status
+        case 0x64:
+            return kbd_read_status(&hw->keyboard);
+
+        // RTC / CMOS
+        case 0x70: case 0x71:
+            return rtc_read(&hw->rtc, port);
+
+        // CGA / Video
+        case 0x3B4: case 0x3B5: case 0x3BA:
+        case 0x3D4: case 0x3D5: case 0x3DA:
+            return cga_read(&hw->cga, port);
+
+        // Game port
+        case 0x201:
+            return 0xFF;  // No joystick
+
+        default:
+            ESP_LOGD(TAG, "IN %04X (unhandled)", port);
+            return 0xFF;
+    }
+}
+
+int pc_hw_tick(pc_hardware_t *hw, uint32_t cpu_cycles) {
+    hw->cpu_cycles += cpu_cycles;
+    hw->refresh_counter += cpu_cycles;
+
+    // Tick PIT based on accumulated CPU cycles
+    hw->pit_tick_accum += cpu_cycles;
+    if (hw->pit_tick_accum >= hw->cycles_per_pit_tick) {
+        uint32_t pit_ticks = hw->pit_tick_accum / hw->cycles_per_pit_tick;
+        hw->pit_tick_accum %= hw->cycles_per_pit_tick;
+
+        // Save old output states
+        bool old_out0 = hw->pit.ch[0].output;
+        (void)old_out0;
+
+        pit_tick(&hw->pit, pit_ticks);
+
+        // PIT channel 0 output → IRQ 0 (timer)
+        // Signal IRQ0 on rising edge of output
+        static bool prev_pit0_output = true;
+        if (hw->pit.ch[0].output && !prev_pit0_output) {
+            pic_signal_irq(&hw->pic_master, IRQ_TIMER);
+        }
+        prev_pit0_output = hw->pit.ch[0].output;
+    }
+
+    // Check keyboard buffer → IRQ 1
+    if (kbd_has_data(&hw->keyboard)) {
+        pic_signal_irq(&hw->pic_master, IRQ_KEYBOARD);
+    }
+
+    // Get highest-priority pending IRQ from master PIC
+    int irq = pic_get_pending_irq(&hw->pic_master);
+    if (irq >= 0) {
+        pic_acknowledge(&hw->pic_master, irq);
+        return hw->pic_master.vector_base + irq;
+    }
+
+    return -1;
+}
+
+// CGA 16-color palette → RGB565 for LCD
+static const uint16_t cga_palette_rgb565[16] = {
+    0x0000, // 0: Black
+    0x0015, // 1: Blue
+    0x0540, // 2: Green
+    0x0555, // 3: Cyan
+    0xA800, // 4: Red
+    0xA815, // 5: Magenta
+    0xAAA0, // 6: Brown/Dark Yellow
+    0xAD55, // 7: Light Gray
+    0x52AA, // 8: Dark Gray
+    0x52BF, // 9: Light Blue
+    0x57EA, // 10: Light Green
+    0x57FF, // 11: Light Cyan
+    0xFAAA, // 12: Light Red
+    0xFABF, // 13: Light Magenta
+    0xFFEA, // 14: Yellow
+    0xFFFF, // 15: White
+};
+
+// IBM PC CGA 8x8 CP437 font - all 256 characters
+// Each character is 8 bytes (one byte per row, MSB = leftmost pixel)
+static const uint8_t cga_font_8x8[256 * 8] = {
+    // 0: NUL (empty)
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    // 1: Smiley
+    0x7E,0x81,0xA5,0x81,0xBD,0x99,0x81,0x7E,
+    // 2: Filled smiley
+    0x7E,0xFF,0xDB,0xFF,0xC3,0xE7,0xFF,0x7E,
+    // 3: Heart
+    0x6C,0xFE,0xFE,0xFE,0x7C,0x38,0x10,0x00,
+    // 4: Diamond
+    0x10,0x38,0x7C,0xFE,0x7C,0x38,0x10,0x00,
+    // 5: Club
+    0x38,0x7C,0x38,0xFE,0xFE,0x7C,0x38,0x7C,
+    // 6: Spade
+    0x10,0x10,0x38,0x7C,0xFE,0x7C,0x38,0x7C,
+    // 7: Bullet
+    0x00,0x00,0x18,0x3C,0x3C,0x18,0x00,0x00,
+    // 8: Inverse bullet
+    0xFF,0xFF,0xE7,0xC3,0xC3,0xE7,0xFF,0xFF,
+    // 9: Circle
+    0x00,0x3C,0x66,0x42,0x42,0x66,0x3C,0x00,
+    // 10: Inverse circle
+    0xFF,0xC3,0x99,0xBD,0xBD,0x99,0xC3,0xFF,
+    // 11: Male
+    0x0F,0x07,0x0F,0x7D,0xCC,0xCC,0xCC,0x78,
+    // 12: Female
+    0x3C,0x66,0x66,0x66,0x3C,0x18,0x7E,0x18,
+    // 13: Music note
+    0x3F,0x33,0x3F,0x30,0x30,0x70,0xF0,0xE0,
+    // 14: Music notes
+    0x7F,0x63,0x7F,0x63,0x63,0x67,0xE6,0xC0,
+    // 15: Sun
+    0x99,0x5A,0x3C,0xE7,0xE7,0x3C,0x5A,0x99,
+    // 16: Right triangle
+    0x80,0xE0,0xF8,0xFE,0xF8,0xE0,0x80,0x00,
+    // 17: Left triangle
+    0x02,0x0E,0x3E,0xFE,0x3E,0x0E,0x02,0x00,
+    // 18: Up/down arrow
+    0x18,0x3C,0x7E,0x18,0x18,0x7E,0x3C,0x18,
+    // 19: Double exclamation
+    0x66,0x66,0x66,0x66,0x66,0x00,0x66,0x00,
+    // 20: Paragraph
+    0x7F,0xDB,0xDB,0x7B,0x1B,0x1B,0x1B,0x00,
+    // 21: Section
+    0x3E,0x63,0x38,0x6C,0x6C,0x38,0xCC,0x78,
+    // 22: Thick underscore
+    0x00,0x00,0x00,0x00,0x7E,0x7E,0x7E,0x00,
+    // 23: Up/down arrow underlined
+    0x18,0x3C,0x7E,0x18,0x7E,0x3C,0x18,0xFF,
+    // 24: Up arrow
+    0x18,0x3C,0x7E,0x18,0x18,0x18,0x18,0x00,
+    // 25: Down arrow
+    0x18,0x18,0x18,0x18,0x7E,0x3C,0x18,0x00,
+    // 26: Right arrow
+    0x00,0x18,0x0C,0xFE,0x0C,0x18,0x00,0x00,
+    // 27: Left arrow
+    0x00,0x30,0x60,0xFE,0x60,0x30,0x00,0x00,
+    // 28: Right angle
+    0x00,0x00,0xC0,0xC0,0xC0,0xFE,0x00,0x00,
+    // 29: Left/right arrow
+    0x00,0x24,0x66,0xFF,0x66,0x24,0x00,0x00,
+    // 30: Up triangle
+    0x00,0x18,0x3C,0x7E,0xFF,0xFF,0x00,0x00,
+    // 31: Down triangle
+    0x00,0xFF,0xFF,0x7E,0x3C,0x18,0x00,0x00,
+    // 32: Space
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    // 33: !
+    0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00,
+    // 34: "
+    0x6C,0x6C,0x6C,0x00,0x00,0x00,0x00,0x00,
+    // 35: #
+    0x6C,0x6C,0xFE,0x6C,0xFE,0x6C,0x6C,0x00,
+    // 36: $
+    0x18,0x3E,0x60,0x3C,0x06,0x7C,0x18,0x00,
+    // 37: %
+    0x00,0xC6,0xCC,0x18,0x30,0x66,0xC6,0x00,
+    // 38: &
+    0x38,0x6C,0x38,0x76,0xDC,0xCC,0x76,0x00,
+    // 39: '
+    0x18,0x18,0x30,0x00,0x00,0x00,0x00,0x00,
+    // 40: (
+    0x0C,0x18,0x30,0x30,0x30,0x18,0x0C,0x00,
+    // 41: )
+    0x30,0x18,0x0C,0x0C,0x0C,0x18,0x30,0x00,
+    // 42: *
+    0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00,
+    // 43: +
+    0x00,0x18,0x18,0x7E,0x18,0x18,0x00,0x00,
+    // 44: ,
+    0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x30,
+    // 45: -
+    0x00,0x00,0x00,0x7E,0x00,0x00,0x00,0x00,
+    // 46: .
+    0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,
+    // 47: /
+    0x06,0x0C,0x18,0x30,0x60,0xC0,0x80,0x00,
+    // 48: 0
+    0x7C,0xC6,0xCE,0xDE,0xF6,0xE6,0x7C,0x00,
+    // 49: 1
+    0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0x00,
+    // 50: 2
+    0x3C,0x66,0x06,0x1C,0x30,0x66,0x7E,0x00,
+    // 51: 3
+    0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00,
+    // 52: 4
+    0x0E,0x1E,0x36,0x66,0x7F,0x06,0x0F,0x00,
+    // 53: 5
+    0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00,
+    // 54: 6
+    0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0x00,
+    // 55: 7
+    0x7E,0x66,0x06,0x0C,0x18,0x18,0x18,0x00,
+    // 56: 8
+    0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00,
+    // 57: 9
+    0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00,
+    // 58: :
+    0x00,0x18,0x18,0x00,0x00,0x18,0x18,0x00,
+    // 59: ;
+    0x00,0x18,0x18,0x00,0x00,0x18,0x18,0x30,
+    // 60: <
+    0x0C,0x18,0x30,0x60,0x30,0x18,0x0C,0x00,
+    // 61: =
+    0x00,0x00,0x7E,0x00,0x7E,0x00,0x00,0x00,
+    // 62: >
+    0x30,0x18,0x0C,0x06,0x0C,0x18,0x30,0x00,
+    // 63: ?
+    0x3C,0x66,0x06,0x0C,0x18,0x00,0x18,0x00,
+    // 64: @
+    0x7C,0xC6,0xDE,0xDE,0xDE,0xC0,0x78,0x00,
+    // 65: A
+    0x18,0x3C,0x66,0x66,0x7E,0x66,0x66,0x00,
+    // 66: B
+    0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0x00,
+    // 67: C
+    0x3C,0x66,0xC0,0xC0,0xC0,0x66,0x3C,0x00,
+    // 68: D
+    0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0x00,
+    // 69: E
+    0x7E,0x60,0x60,0x78,0x60,0x60,0x7E,0x00,
+    // 70: F
+    0x7E,0x60,0x60,0x78,0x60,0x60,0x60,0x00,
+    // 71: G
+    0x3C,0x66,0xC0,0xC0,0xCE,0x66,0x3E,0x00,
+    // 72: H
+    0x66,0x66,0x66,0x7E,0x66,0x66,0x66,0x00,
+    // 73: I
+    0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,
+    // 74: J
+    0x1E,0x0C,0x0C,0x0C,0x0C,0x6C,0x38,0x00,
+    // 75: K
+    0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0x00,
+    // 76: L
+    0x60,0x60,0x60,0x60,0x60,0x60,0x7E,0x00,
+    // 77: M
+    0xC6,0xEE,0xFE,0xFE,0xD6,0xC6,0xC6,0x00,
+    // 78: N
+    0xC6,0xE6,0xF6,0xDE,0xCE,0xC6,0xC6,0x00,
+    // 79: O
+    0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,
+    // 80: P
+    0x7C,0x66,0x66,0x7C,0x60,0x60,0x60,0x00,
+    // 81: Q
+    0x3C,0x66,0x66,0x66,0x66,0x6C,0x36,0x00,
+    // 82: R
+    0x7C,0x66,0x66,0x7C,0x6C,0x66,0x66,0x00,
+    // 83: S
+    0x3C,0x66,0x60,0x3C,0x06,0x66,0x3C,0x00,
+    // 84: T
+    0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x00,
+    // 85: U
+    0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0x00,
+    // 86: V
+    0x66,0x66,0x66,0x66,0x66,0x3C,0x18,0x00,
+    // 87: W
+    0xC6,0xC6,0xC6,0xD6,0xFE,0xEE,0xC6,0x00,
+    // 88: X
+    0xC6,0xC6,0x6C,0x38,0x6C,0xC6,0xC6,0x00,
+    // 89: Y
+    0x66,0x66,0x66,0x3C,0x18,0x18,0x18,0x00,
+    // 90: Z
+    0xFE,0x06,0x0C,0x18,0x30,0x60,0xFE,0x00,
+    // 91: [
+    0x3C,0x30,0x30,0x30,0x30,0x30,0x3C,0x00,
+    // 92: backslash
+    0xC0,0x60,0x30,0x18,0x0C,0x06,0x02,0x00,
+    // 93: ]
+    0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C,0x00,
+    // 94: ^
+    0x10,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00,
+    // 95: _
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,
+    // 96: `
+    0x30,0x30,0x18,0x00,0x00,0x00,0x00,0x00,
+    // 97: a
+    0x00,0x00,0x3C,0x06,0x3E,0x66,0x3E,0x00,
+    // 98: b
+    0x60,0x60,0x7C,0x66,0x66,0x66,0x7C,0x00,
+    // 99: c
+    0x00,0x00,0x3C,0x66,0x60,0x66,0x3C,0x00,
+    // 100: d
+    0x06,0x06,0x3E,0x66,0x66,0x66,0x3E,0x00,
+    // 101: e
+    0x00,0x00,0x3C,0x66,0x7E,0x60,0x3C,0x00,
+    // 102: f
+    0x1C,0x36,0x30,0x78,0x30,0x30,0x30,0x00,
+    // 103: g
+    0x00,0x00,0x3E,0x66,0x66,0x3E,0x06,0x3C,
+    // 104: h
+    0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x00,
+    // 105: i
+    0x18,0x00,0x38,0x18,0x18,0x18,0x3C,0x00,
+    // 106: j
+    0x06,0x00,0x06,0x06,0x06,0x06,0x66,0x3C,
+    // 107: k
+    0x60,0x60,0x66,0x6C,0x78,0x6C,0x66,0x00,
+    // 108: l
+    0x38,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,
+    // 109: m
+    0x00,0x00,0xEC,0xFE,0xD6,0xD6,0xC6,0x00,
+    // 110: n
+    0x00,0x00,0x7C,0x66,0x66,0x66,0x66,0x00,
+    // 111: o
+    0x00,0x00,0x3C,0x66,0x66,0x66,0x3C,0x00,
+    // 112: p
+    0x00,0x00,0x7C,0x66,0x66,0x7C,0x60,0x60,
+    // 113: q
+    0x00,0x00,0x3E,0x66,0x66,0x3E,0x06,0x06,
+    // 114: r
+    0x00,0x00,0x7C,0x66,0x60,0x60,0x60,0x00,
+    // 115: s
+    0x00,0x00,0x3E,0x60,0x3C,0x06,0x7C,0x00,
+    // 116: t
+    0x30,0x30,0x7C,0x30,0x30,0x36,0x1C,0x00,
+    // 117: u
+    0x00,0x00,0x66,0x66,0x66,0x66,0x3E,0x00,
+    // 118: v
+    0x00,0x00,0x66,0x66,0x66,0x3C,0x18,0x00,
+    // 119: w
+    0x00,0x00,0xC6,0xD6,0xFE,0x7C,0x6C,0x00,
+    // 120: x
+    0x00,0x00,0xC6,0x6C,0x38,0x6C,0xC6,0x00,
+    // 121: y
+    0x00,0x00,0x66,0x66,0x66,0x3E,0x06,0x3C,
+    // 122: z
+    0x00,0x00,0x7E,0x0C,0x18,0x30,0x7E,0x00,
+    // 123: {
+    0x0E,0x18,0x18,0x70,0x18,0x18,0x0E,0x00,
+    // 124: |
+    0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00,
+    // 125: }
+    0x70,0x18,0x18,0x0E,0x18,0x18,0x70,0x00,
+    // 126: ~
+    0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00,
+    // 127: House/DEL
+    0x00,0x10,0x38,0x6C,0xC6,0xC6,0xFE,0x00,
+    // 128: C-cedilla
+    0x3C,0x66,0x60,0x60,0x66,0x3C,0x0C,0x38,
+    // 129: u-dieresis
+    0x66,0x00,0x66,0x66,0x66,0x66,0x3E,0x00,
+    // 130: e-acute
+    0x0C,0x18,0x3C,0x66,0x7E,0x60,0x3C,0x00,
+    // 131: a-circumflex
+    0x18,0x66,0x3C,0x06,0x3E,0x66,0x3E,0x00,
+    // 132: a-dieresis
+    0x66,0x00,0x3C,0x06,0x3E,0x66,0x3E,0x00,
+    // 133: a-grave
+    0x30,0x18,0x3C,0x06,0x3E,0x66,0x3E,0x00,
+    // 134: a-ring
+    0x18,0x18,0x3C,0x06,0x3E,0x66,0x3E,0x00,
+    // 135: c-cedilla
+    0x00,0x00,0x3C,0x66,0x60,0x66,0x3C,0x38,
+    // 136: e-circumflex
+    0x18,0x66,0x3C,0x66,0x7E,0x60,0x3C,0x00,
+    // 137: e-dieresis
+    0x66,0x00,0x3C,0x66,0x7E,0x60,0x3C,0x00,
+    // 138: e-grave
+    0x30,0x18,0x3C,0x66,0x7E,0x60,0x3C,0x00,
+    // 139: i-dieresis
+    0x66,0x00,0x38,0x18,0x18,0x18,0x3C,0x00,
+    // 140: i-circumflex
+    0x18,0x66,0x00,0x38,0x18,0x18,0x3C,0x00,
+    // 141: i-grave
+    0x30,0x18,0x00,0x38,0x18,0x18,0x3C,0x00,
+    // 142: A-dieresis
+    0x66,0x00,0x18,0x3C,0x66,0x7E,0x66,0x00,
+    // 143: A-ring
+    0x18,0x18,0x00,0x3C,0x66,0x7E,0x66,0x00,
+    // 144: E-acute
+    0x0C,0x18,0x7E,0x60,0x78,0x60,0x7E,0x00,
+    // 145: ae ligature
+    0x00,0x00,0x6E,0x3B,0x7E,0xD8,0x6E,0x00,
+    // 146: AE ligature
+    0x3F,0x6C,0xCC,0xFF,0xCC,0xCC,0xCF,0x00,
+    // 147: o-circumflex
+    0x18,0x66,0x00,0x3C,0x66,0x66,0x3C,0x00,
+    // 148: o-dieresis
+    0x66,0x00,0x3C,0x66,0x66,0x66,0x3C,0x00,
+    // 149: o-grave
+    0x30,0x18,0x3C,0x66,0x66,0x66,0x3C,0x00,
+    // 150: u-circumflex
+    0x18,0x66,0x00,0x66,0x66,0x66,0x3E,0x00,
+    // 151: u-grave
+    0x30,0x18,0x00,0x66,0x66,0x66,0x3E,0x00,
+    // 152: y-dieresis
+    0x66,0x00,0x66,0x66,0x66,0x3E,0x06,0x3C,
+    // 153: O-dieresis
+    0x66,0x00,0x3C,0x66,0x66,0x66,0x3C,0x00,
+    // 154: U-dieresis
+    0x66,0x00,0x66,0x66,0x66,0x66,0x3C,0x00,
+    // 155: Cent sign
+    0x18,0x18,0x7E,0xC0,0xC0,0x7E,0x18,0x18,
+    // 156: Pound sign
+    0x38,0x6C,0x64,0xF0,0x60,0x66,0xFC,0x00,
+    // 157: Yen sign
+    0x66,0x66,0x3C,0x7E,0x18,0x7E,0x18,0x18,
+    // 158: Peseta
+    0xF8,0xCC,0xCC,0xFA,0xC6,0xCF,0xC6,0xC7,
+    // 159: f-hook
+    0x0E,0x1B,0x18,0x3C,0x18,0x18,0xD8,0x70,
+    // 160: a-acute
+    0x0C,0x18,0x3C,0x06,0x3E,0x66,0x3E,0x00,
+    // 161: i-acute
+    0x0C,0x18,0x00,0x38,0x18,0x18,0x3C,0x00,
+    // 162: o-acute
+    0x0C,0x18,0x3C,0x66,0x66,0x66,0x3C,0x00,
+    // 163: u-acute
+    0x0C,0x18,0x00,0x66,0x66,0x66,0x3E,0x00,
+    // 164: n-tilde
+    0x76,0xDC,0x00,0x7C,0x66,0x66,0x66,0x00,
+    // 165: N-tilde
+    0x76,0xDC,0xC6,0xE6,0xF6,0xDE,0xCE,0x00,
+    // 166: Feminine ordinal
+    0x3C,0x6C,0x6C,0x3E,0x00,0x7E,0x00,0x00,
+    // 167: Masculine ordinal
+    0x38,0x6C,0x6C,0x38,0x00,0x7C,0x00,0x00,
+    // 168: Inverted question mark
+    0x18,0x00,0x18,0x18,0x30,0x66,0x3C,0x00,
+    // 169: Reversed not sign
+    0x00,0x00,0x00,0xFC,0xC0,0xC0,0x00,0x00,
+    // 170: Not sign
+    0x00,0x00,0x00,0x3F,0x03,0x03,0x00,0x00,
+    // 171: One half
+    0xC0,0xCC,0xD8,0x30,0x60,0xDC,0x86,0x1F,
+    // 172: One quarter
+    0xC0,0xCC,0xD8,0x30,0x6C,0xDC,0x0C,0x0E,
+    // 173: Inverted exclamation
+    0x18,0x00,0x18,0x18,0x3C,0x3C,0x18,0x00,
+    // 174: Left guillemet
+    0x00,0x36,0x6C,0xD8,0x6C,0x36,0x00,0x00,
+    // 175: Right guillemet
+    0x00,0xD8,0x6C,0x36,0x6C,0xD8,0x00,0x00,
+    // 176: Light shade
+    0x11,0x44,0x11,0x44,0x11,0x44,0x11,0x44,
+    // 177: Medium shade
+    0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,
+    // 178: Dark shade
+    0xDD,0xBB,0xDD,0xBB,0xDD,0xBB,0xDD,0xBB,
+    // 179: Box vert │
+    0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,
+    // 180: Box vert-left ┤
+    0x18,0x18,0x18,0x18,0xF8,0x18,0x18,0x18,
+    // 181: Box vert-left double ╡
+    0x18,0x18,0xF8,0x18,0xF8,0x18,0x18,0x18,
+    // 182: Box double vert-left ╢
+    0x36,0x36,0x36,0x36,0xF6,0x36,0x36,0x36,
+    // 183: Box down-left double ╖
+    0x00,0x00,0x00,0x00,0xFE,0x36,0x36,0x36,
+    // 184: Box down-left ╕
+    0x00,0x00,0xF8,0x18,0xF8,0x18,0x18,0x18,
+    // 185: Box double vert-left ╣
+    0x36,0x36,0xF6,0x06,0xF6,0x36,0x36,0x36,
+    // 186: Box double vert ║
+    0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x36,
+    // 187: Box double down-left ╗
+    0x00,0x00,0xFE,0x06,0xF6,0x36,0x36,0x36,
+    // 188: Box double up-left ╝
+    0x36,0x36,0xF6,0x06,0xFE,0x00,0x00,0x00,
+    // 189: Box double up-left ╜
+    0x36,0x36,0x36,0x36,0xFE,0x00,0x00,0x00,
+    // 190: Box up-left double ╛
+    0x18,0x18,0xF8,0x18,0xF8,0x00,0x00,0x00,
+    // 191: Box down-left ┐
+    0x00,0x00,0x00,0x00,0xF8,0x18,0x18,0x18,
+    // 192: Box up-right └
+    0x18,0x18,0x18,0x18,0x1F,0x00,0x00,0x00,
+    // 193: Box up-horiz ┴
+    0x18,0x18,0x18,0x18,0xFF,0x00,0x00,0x00,
+    // 194: Box down-horiz ┬
+    0x00,0x00,0x00,0x00,0xFF,0x18,0x18,0x18,
+    // 195: Box vert-right ├
+    0x18,0x18,0x18,0x18,0x1F,0x18,0x18,0x18,
+    // 196: Box horiz ─
+    0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00,
+    // 197: Box vert-horiz ┼
+    0x18,0x18,0x18,0x18,0xFF,0x18,0x18,0x18,
+    // 198: Box vert-right double ╞
+    0x18,0x18,0x1F,0x18,0x1F,0x18,0x18,0x18,
+    // 199: Box double vert-right ╟
+    0x36,0x36,0x36,0x36,0x37,0x36,0x36,0x36,
+    // 200: Box double up-right ╚
+    0x36,0x36,0x37,0x30,0x3F,0x00,0x00,0x00,
+    // 201: Box double down-right ╔
+    0x00,0x00,0x3F,0x30,0x37,0x36,0x36,0x36,
+    // 202: Box double up-horiz ╩
+    0x36,0x36,0xF7,0x00,0xFF,0x00,0x00,0x00,
+    // 203: Box double down-horiz ╦
+    0x00,0x00,0xFF,0x00,0xF7,0x36,0x36,0x36,
+    // 204: Box double vert-right ╠
+    0x36,0x36,0x37,0x30,0x37,0x36,0x36,0x36,
+    // 205: Box double horiz ═
+    0x00,0x00,0xFF,0x00,0xFF,0x00,0x00,0x00,
+    // 206: Box double vert-horiz ╬
+    0x36,0x36,0xF7,0x00,0xF7,0x36,0x36,0x36,
+    // 207: Box up-horiz double ╧
+    0x18,0x18,0xFF,0x00,0xFF,0x00,0x00,0x00,
+    // 208: Box double up-horiz ╨
+    0x36,0x36,0x36,0x36,0xFF,0x00,0x00,0x00,
+    // 209: Box down-horiz double ╤
+    0x00,0x00,0xFF,0x00,0xFF,0x18,0x18,0x18,
+    // 210: Box double down-horiz ╥
+    0x00,0x00,0x00,0x00,0xFF,0x36,0x36,0x36,
+    // 211: Box double up-right ╙
+    0x36,0x36,0x36,0x36,0x3F,0x00,0x00,0x00,
+    // 212: Box up-right double ╘
+    0x18,0x18,0x1F,0x18,0x1F,0x00,0x00,0x00,
+    // 213: Box down-right double ╒
+    0x00,0x00,0x1F,0x18,0x1F,0x18,0x18,0x18,
+    // 214: Box double down-right ╓
+    0x00,0x00,0x00,0x00,0x3F,0x36,0x36,0x36,
+    // 215: Box double vert-horiz ╫
+    0x36,0x36,0x36,0x36,0xFF,0x36,0x36,0x36,
+    // 216: Box vert-horiz double ╪
+    0x18,0x18,0xFF,0x18,0xFF,0x18,0x18,0x18,
+    // 217: Box up-left ┘
+    0x18,0x18,0x18,0x18,0xF8,0x00,0x00,0x00,
+    // 218: Box down-right ┌
+    0x00,0x00,0x00,0x00,0x1F,0x18,0x18,0x18,
+    // 219: Full block █
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    // 220: Lower half block ▄
+    0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,
+    // 221: Left half block ▌
+    0xF0,0xF0,0xF0,0xF0,0xF0,0xF0,0xF0,0xF0,
+    // 222: Right half block ▐
+    0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
+    // 223: Upper half block ▀
+    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,
+    // 224: Alpha
+    0x00,0x00,0x76,0xDC,0xC8,0xDC,0x76,0x00,
+    // 225: Beta/sharp s
+    0x00,0x78,0xCC,0xF8,0xCC,0xF8,0xC0,0xC0,
+    // 226: Gamma
+    0x00,0xFE,0xC6,0xC0,0xC0,0xC0,0xC0,0x00,
+    // 227: Pi
+    0x00,0x00,0xFE,0x6C,0x6C,0x6C,0x6C,0x00,
+    // 228: Sigma (upper)
+    0xFE,0xC6,0x60,0x30,0x60,0xC6,0xFE,0x00,
+    // 229: Sigma (lower)
+    0x00,0x00,0x7E,0xD8,0xD8,0xD8,0x70,0x00,
+    // 230: Mu
+    0x00,0x00,0x66,0x66,0x66,0x7C,0x60,0xC0,
+    // 231: Tau
+    0x00,0x00,0x76,0xDC,0x18,0x18,0x18,0x00,
+    // 232: Phi
+    0x7E,0x18,0x3C,0x66,0x66,0x3C,0x18,0x7E,
+    // 233: Theta
+    0x38,0x6C,0xC6,0xFE,0xC6,0x6C,0x38,0x00,
+    // 234: Omega
+    0x38,0x6C,0xC6,0xC6,0x6C,0x6C,0xEE,0x00,
+    // 235: Delta
+    0x1C,0x30,0x18,0x7C,0xCC,0xCC,0x78,0x00,
+    // 236: Infinity
+    0x00,0x00,0x7E,0xDB,0xDB,0x7E,0x00,0x00,
+    // 237: Phi (var)
+    0x06,0x0C,0x7E,0xDB,0xDB,0x7E,0x60,0xC0,
+    // 238: Epsilon
+    0x38,0x60,0xC0,0xF8,0xC0,0x60,0x38,0x00,
+    // 239: Intersection
+    0x78,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0x00,
+    // 240: Identical
+    0x00,0x7E,0x00,0x7E,0x00,0x7E,0x00,0x00,
+    // 241: Plus-minus
+    0x18,0x18,0x7E,0x18,0x18,0x00,0x7E,0x00,
+    // 242: Greater-equal
+    0x60,0x30,0x18,0x0C,0x18,0x30,0x60,0x7E,
+    // 243: Less-equal
+    0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x7E,
+    // 244: Top integral
+    0x0E,0x1B,0x1B,0x18,0x18,0x18,0x18,0x18,
+    // 245: Bottom integral
+    0x18,0x18,0x18,0x18,0x18,0xD8,0xD8,0x70,
+    // 246: Division
+    0x18,0x18,0x00,0x7E,0x00,0x18,0x18,0x00,
+    // 247: Approximately equal
+    0x00,0x76,0xDC,0x00,0x76,0xDC,0x00,0x00,
+    // 248: Degree
+    0x38,0x6C,0x6C,0x38,0x00,0x00,0x00,0x00,
+    // 249: Bullet operator
+    0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,
+    // 250: Middle dot
+    0x00,0x00,0x00,0x00,0x18,0x00,0x00,0x00,
+    // 251: Square root
+    0x0F,0x0C,0x0C,0x0C,0xEC,0x6C,0x3C,0x1C,
+    // 252: Superscript n
+    0x78,0x6C,0x6C,0x6C,0x6C,0x00,0x00,0x00,
+    // 253: Superscript 2
+    0x70,0x18,0x30,0x60,0x78,0x00,0x00,0x00,
+    // 254: Filled square
+    0x00,0x00,0x3C,0x3C,0x3C,0x3C,0x00,0x00,
+    // 255: Non-breaking space
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+};
+
+// CGA character cell dimensions for 80x25 on 480x320 LCD
+#define CGA_CELL_W  6    // 480 / 80 = 6 pixels wide (use leftmost 6 of 8 font bits)
+#define CGA_CELL_H  12   // 320 / 25 = 12.8, use 12 (8 font rows stretched to 12)
+
+// Mapping table: which font row to display at each of 12 output rows
+// This stretches 8 rows to 12 by doubling every other row
+static const uint8_t cga_row_map[12] = { 0, 0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7 };
+
+void pc_hw_render_text(pc_hardware_t *hw, const uint8_t *video_mem) {
+    if (!video_card_is_initialized()) return;
+    if (!hw->cga.needs_refresh) return;
+    hw->cga.needs_refresh = false;
+
+    uint16_t *fb = video_card_get_back_buffer();
+    if (!fb) return;
+
+    uint16_t fb_w = video_card_get_width();   // 480
+    uint16_t fb_h = video_card_get_height();  // 320
+
+    // 80x25 @ 6x12 = 480x300, centered vertically
+    int text_h = CGA_TEXT_ROWS * CGA_CELL_H;  // 300
+    int y_off = (fb_h - text_h) / 2;          // 10
+
+    // CGA overscan/border color from color select register
+    uint16_t border_color = cga_palette_rgb565[hw->cga.color_reg & 0x0F];
+
+    // Fill top border
+    for (int y = 0; y < y_off; y++) {
+        uint16_t *row_ptr = &fb[y * fb_w];
+        for (int x = 0; x < fb_w; x++) {
+            row_ptr[x] = border_color;
+        }
+    }
+
+    // Fill bottom border
+    for (int y = y_off + text_h; y < fb_h; y++) {
+        uint16_t *row_ptr = &fb[y * fb_w];
+        for (int x = 0; x < fb_w; x++) {
+            row_ptr[x] = border_color;
+        }
+    }
+
+    const uint8_t *vram = video_mem + (hw->cga.mem_offset * 2);
+
+    // Render 80x25 character cells
+    for (int row = 0; row < CGA_TEXT_ROWS; row++) {
+        for (int col = 0; col < CGA_TEXT_COLS; col++) {
+            int vram_offset = (row * CGA_TEXT_COLS + col) * 2;
+            uint8_t ch   = vram[vram_offset];
+            uint8_t attr = vram[vram_offset + 1];
+
+            uint16_t fg = cga_palette_rgb565[attr & 0x0F];
+            uint16_t bg = cga_palette_rgb565[(attr >> 4) & 0x07];
+            // Bit 7: treat as high-intensity background (not blink)
+            if (attr & 0x80) {
+                bg = cga_palette_rgb565[((attr >> 4) & 0x07) | 0x08];
+            }
+
+            const uint8_t *glyph = &cga_font_8x8[ch * 8];
+            int px = col * CGA_CELL_W;
+            int py = y_off + row * CGA_CELL_H;
+
+            for (int gy = 0; gy < CGA_CELL_H; gy++) {
+                uint8_t bits = glyph[cga_row_map[gy]];
+                uint16_t *rp = &fb[(py + gy) * fb_w + px];
+                // Render 6 pixels (bits 7..2 of font byte)
+                rp[0] = (bits & 0x80) ? fg : bg;
+                rp[1] = (bits & 0x40) ? fg : bg;
+                rp[2] = (bits & 0x20) ? fg : bg;
+                rp[3] = (bits & 0x10) ? fg : bg;
+                rp[4] = (bits & 0x08) ? fg : bg;
+                rp[5] = (bits & 0x04) ? fg : bg;
+            }
+        }
+    }
+
+    // Render cursor
+    if (hw->cga.cursor_visible) {
+        int cpos = (int)hw->cga.cursor_pos - (int)hw->cga.mem_offset;
+        int crow = cpos / CGA_TEXT_COLS;
+        int ccol = cpos % CGA_TEXT_COLS;
+        if (crow >= 0 && crow < CGA_TEXT_ROWS && ccol >= 0 && ccol < CGA_TEXT_COLS) {
+            int vram_offset = (crow * CGA_TEXT_COLS + ccol) * 2;
+            uint8_t attr = vram[vram_offset + 1];
+            uint16_t fg = cga_palette_rgb565[attr & 0x0F];
+            int px = ccol * CGA_CELL_W;
+            int py = y_off + crow * CGA_CELL_H;
+            // Scale cursor scanlines from 8-row to 12-row space
+            int cstart = (hw->cga.cursor_start * CGA_CELL_H) / 8;
+            int cend   = (hw->cga.cursor_end * CGA_CELL_H) / 8;
+            if (cend >= CGA_CELL_H) cend = CGA_CELL_H - 1;
+            for (int cy = cstart; cy <= cend; cy++) {
+                uint16_t *rp = &fb[(py + cy) * fb_w + px];
+                for (int cx = 0; cx < CGA_CELL_W; cx++) {
+                    rp[cx] = fg;
+                }
+            }
+        }
+    }
+
+    video_card_present();
+}

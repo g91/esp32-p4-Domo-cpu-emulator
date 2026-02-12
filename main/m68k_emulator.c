@@ -75,6 +75,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "m68k_emulator.h"
 #include "bus_controller.h"
 
@@ -122,6 +123,7 @@ typedef struct {
     bool running;
     bool halted;
     bool stopped;
+    uint8_t pending_irq; // Pending interrupt level (0-7, 0=none)
     uint64_t cycles;
     uint32_t instructions_executed;
 } m68k_cpu_t;
@@ -158,27 +160,125 @@ typedef struct {
     uint64_t start_time;     // Execution start time (cycles)
     uint64_t watchdog_cycles; // Last watchdog reset cycle
     uint32_t watchdog_pc;    // PC at last watchdog reset
+    uint32_t watchdog_pc_min; // Min PC seen since last watchdog check
+    uint32_t watchdog_pc_max; // Max PC seen since last watchdog check
     uint32_t recovery_count; // Number of recoveries performed
     uint32_t safe_pc;        // Safe PC to return to
     uint32_t safe_sp;        // Safe SP to return to
+    uint64_t last_io_access; // Last I/O device access time (cycles)
+    uint64_t stop_cycles;    // Cycles when STOP was entered (for timeout)
 } exception_recovery_t;
 
 static m68k_cpu_t *cpu = NULL;
 static m68k_crash_context_t crash_ctx = {0};
 static exception_recovery_t recovery_state = {
     .enabled = false,
-    .timeout_ms = 5000,      // 5 second default timeout
+    .timeout_ms = 0,         // Timeout disabled by default (0 = no timeout)
     .recovery_count = 0,
-    .watchdog_pc = 0
+    .watchdog_pc = 0,
+    .last_io_access = 0
 };
 static mem_region_t *gc_regions = NULL;
 static bool watchdog_enabled = true;
 static const uint32_t WATCHDOG_CYCLE_LIMIT = 10000000; // 10M cycles (~167ms @ 60MHz)
+static bool in_group0 = false;  // Moved to module scope for reset/recovery access
 
 // Memory access functions
 // The Motorola 68000 has a 24-bit address bus (A0-A23).
 // The upper 8 bits of any address are physically not connected and must be masked.
 #define M68K_ADDRESS_MASK 0x00FFFFFF
+
+// External I/O hooks (for Atari ST, etc.)
+static m68k_io_read_hook_t  s_io_read_hook  = NULL;
+static m68k_io_write_hook_t s_io_write_hook = NULL;
+
+void m68k_set_io_hooks(m68k_io_read_hook_t read_hook, m68k_io_write_hook_t write_hook) {
+    s_io_read_hook  = read_hook;
+    s_io_write_hook = write_hook;
+}
+
+// External IRQ support
+static m68k_irq_ack_hook_t s_irq_ack_hook = NULL;
+
+// Address from last get_ea_value() call - used by set_ea_value_writeback()
+// to write back to the same address without re-consuming extension words
+// or double-updating address registers for modes 3/4/5/6/7
+static uint32_t s_last_ea_addr = 0;
+
+// Instruction history ring buffer for crash diagnostics
+#define INST_HISTORY_SIZE 32
+typedef struct {
+    uint32_t pc;
+    uint16_t opcode;
+    uint32_t sp;
+    uint16_t sr;
+} inst_history_entry_t;
+static inst_history_entry_t s_inst_history[INST_HISTORY_SIZE];
+static int s_inst_history_idx = 0;
+
+static void inst_history_record(uint32_t pc, uint16_t opcode, uint32_t sp, uint16_t sr) {
+    s_inst_history[s_inst_history_idx].pc = pc;
+    s_inst_history[s_inst_history_idx].opcode = opcode;
+    s_inst_history[s_inst_history_idx].sp = sp;
+    s_inst_history[s_inst_history_idx].sr = sr;
+    s_inst_history_idx = (s_inst_history_idx + 1) % INST_HISTORY_SIZE;
+}
+
+static void inst_history_dump(void) {
+    ESP_LOGE(TAG, "=== Last %d instructions before crash ===", INST_HISTORY_SIZE);
+    for (int i = 0; i < INST_HISTORY_SIZE; i++) {
+        int idx = (s_inst_history_idx + i) % INST_HISTORY_SIZE;
+        inst_history_entry_t *e = &s_inst_history[idx];
+        if (e->pc == 0 && e->opcode == 0) continue; // empty slot
+        ESP_LOGE(TAG, "  [%2d] PC=%08lX Op=%04X SP=%08lX SR=%04X",
+                 i, (unsigned long)e->pc, e->opcode, (unsigned long)e->sp, e->sr);
+    }
+    ESP_LOGE(TAG, "=== End instruction history ===");
+    // Dump registers
+    if (cpu) {
+        ESP_LOGE(TAG, "Registers: D0=%08lX D1=%08lX D2=%08lX D3=%08lX",
+                 (unsigned long)cpu->d[0], (unsigned long)cpu->d[1],
+                 (unsigned long)cpu->d[2], (unsigned long)cpu->d[3]);
+        ESP_LOGE(TAG, "           D4=%08lX D5=%08lX D6=%08lX D7=%08lX",
+                 (unsigned long)cpu->d[4], (unsigned long)cpu->d[5],
+                 (unsigned long)cpu->d[6], (unsigned long)cpu->d[7]);
+        ESP_LOGE(TAG, "           A0=%08lX A1=%08lX A2=%08lX A3=%08lX",
+                 (unsigned long)cpu->a[0], (unsigned long)cpu->a[1],
+                 (unsigned long)cpu->a[2], (unsigned long)cpu->a[3]);
+        ESP_LOGE(TAG, "           A4=%08lX A5=%08lX A6=%08lX A7=%08lX",
+                 (unsigned long)cpu->a[4], (unsigned long)cpu->a[5],
+                 (unsigned long)cpu->a[6], (unsigned long)cpu->a[7]);
+        ESP_LOGE(TAG, "           USP=%08lX SSP=%08lX SR=%04X",
+                 (unsigned long)cpu->usp, (unsigned long)cpu->ssp, cpu->sr);
+    }
+}
+
+void m68k_set_irq(uint8_t level) {
+    if (cpu) {
+        cpu->pending_irq = level & 7;
+        // If CPU was stopped (STOP instruction), wake it up if interrupt is accepted
+        if (cpu->stopped && level > 0) {
+            uint8_t current_mask = (cpu->sr >> 8) & 7;
+            if (level > current_mask || level == 7) {
+                cpu->stopped = false;
+            }
+        }
+    }
+}
+
+void m68k_set_irq_ack_hook(m68k_irq_ack_hook_t hook) {
+    s_irq_ack_hook = hook;
+}
+
+static m68k_reset_hook_t s_reset_hook = NULL;
+
+void m68k_set_reset_hook(m68k_reset_hook_t hook) {
+    s_reset_hook = hook;
+}
+
+uint64_t m68k_get_cycles(void) {
+    return cpu ? cpu->cycles : 0;
+}
 
 // Forward declarations
 static inline uint8_t read_byte(uint32_t addr);
@@ -221,8 +321,10 @@ static bool try_exception_recovery(int exception_type) {
     
     // Too many recoveries = probably infinite crash loop
     if (recovery_state.recovery_count > 10) {
-        ESP_LOGE(TAG, "Too many recoveries (%d), disabling recovery mode", recovery_state.recovery_count);
+        ESP_LOGE(TAG, "Too many recoveries (%d), disabling recovery mode - CPU halted", recovery_state.recovery_count);
         recovery_state.enabled = false;
+        cpu->halted = true;
+        cpu->running = false;
         return false;
     }
     
@@ -256,24 +358,39 @@ static bool try_exception_recovery(int exception_type) {
 
 static void check_watchdog(void) {
     if (!watchdog_enabled) return;
-    
-    // Check for true infinite loop: same PC for extended period
+
+    // Check for infinite loop: PC stuck in tight range for extended period
     if (cpu->cycles - recovery_state.watchdog_cycles > WATCHDOG_CYCLE_LIMIT) {
-        // Only trigger if PC hasn't changed at all
-        if (cpu->pc == recovery_state.watchdog_pc) {
+        // Check if we've done recent I/O (within last 100M cycles = ~1.67 seconds @ 60MHz)
+        uint64_t io_age = cpu->cycles - recovery_state.last_io_access;
+        bool recently_did_io = (io_age < (WATCHDOG_CYCLE_LIMIT * 10));
+
+        // Trigger if PC is stuck OR oscillating in tight range (< 16 bytes) AND no I/O
+        uint32_t pc_range = (recovery_state.watchdog_pc_max >= recovery_state.watchdog_pc_min) ?
+                            (recovery_state.watchdog_pc_max - recovery_state.watchdog_pc_min) : 0;
+        bool pc_stuck = (cpu->pc == recovery_state.watchdog_pc) || (pc_range < 16);
+
+        if (pc_stuck && !recently_did_io) {
             char msg[128];
-            snprintf(msg, sizeof(msg), "Watchdog timeout: CPU stuck at PC=0x%08lX", (unsigned long)cpu->pc);
+            snprintf(msg, sizeof(msg), "Watchdog timeout: CPU stuck at PC=0x%08lX (range=%lu bytes)",
+                     (unsigned long)cpu->pc, (unsigned long)pc_range);
             ESP_LOGW(TAG, "%s", msg);
-            
-            save_crash_context(cpu->pc, msg, 8); // Watchdog exception
-            
+
+            save_crash_context(cpu->pc, msg, 8);
+
             if (!try_exception_recovery(8)) {
                 cpu->halted = true;
             }
         }
-        // PC changed, so reset watchdog
+        // Reset watchdog tracking for next period
         recovery_state.watchdog_cycles = cpu->cycles;
         recovery_state.watchdog_pc = cpu->pc;
+        recovery_state.watchdog_pc_min = cpu->pc;
+        recovery_state.watchdog_pc_max = cpu->pc;
+    } else {
+        // Track PC range during the watchdog period
+        if (cpu->pc < recovery_state.watchdog_pc_min) recovery_state.watchdog_pc_min = cpu->pc;
+        if (cpu->pc > recovery_state.watchdog_pc_max) recovery_state.watchdog_pc_max = cpu->pc;
     }
 }
 
@@ -284,6 +401,17 @@ static void check_execution_timeout(void) {
     uint64_t timeout_cycles = (uint64_t)recovery_state.timeout_ms * (M68K_CPU_FREQ_MHZ * 1000);
     
     if (elapsed_cycles > timeout_cycles) {
+        // Check if we've done recent I/O (within last 100M cycles = ~1.67 seconds @ 60MHz)
+        // If so, reset the timeout - CPU is doing I/O, not stuck
+        uint64_t io_age = cpu->cycles - recovery_state.last_io_access;
+        bool recently_did_io = (io_age < (WATCHDOG_CYCLE_LIMIT * 10)); // 10x watchdog period
+        
+        if (recently_did_io) {
+            // Reset timeout counter - CPU is actively doing I/O
+            recovery_state.start_time = cpu->cycles;
+            return;
+        }
+        
         char msg[128];
         snprintf(msg, sizeof(msg), "Execution timeout (%lums) at PC=0x%08lX", 
                  (unsigned long)recovery_state.timeout_ms, (unsigned long)cpu->pc);
@@ -351,10 +479,20 @@ static void gc_sweep_unused(void) {
     }
 }
 
+// Forward declaration for group 0 exceptions (bus error, address error)
+static void raise_group0_exception(uint32_t vector, uint32_t access_addr, bool is_read);
+
 static inline uint8_t read_byte(uint32_t addr) {
     addr &= M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
+    // Check external I/O hook first (Atari ST, etc.)
+    if (s_io_read_hook) {
+        bool handled = false;
+        uint32_t val = s_io_read_hook(addr, 1, &handled);
+        if (handled) return (uint8_t)val;
+    }
     // Check if address is in bus I/O range
     if (addr >= BUS_IO_BASE && addr < (BUS_IO_BASE + BUS_IO_SIZE)) {
+        recovery_state.last_io_access = cpu->cycles;  // Mark I/O access
         return (uint8_t)bus_io_read(addr, 1);
     }
 
@@ -374,51 +512,35 @@ static inline uint16_t read_word(uint32_t addr) {
     // Mark GC access
     gc_mark_access(addr);
     
-    // M68K: Word access to odd address triggers Address Error exception
-    if (addr & 1) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Read word from odd address 0x%08lX at PC=0x%08lX", (unsigned long)addr, (unsigned long)cpu->last_pc);
-        ESP_LOGE(TAG, "%s", msg);
-        ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        
-        save_crash_context(addr, msg, 2); // Address error
-        
-        if (!try_exception_recovery(2)) {
-            cpu->halted = true;
-        }
-        return 0;
+    // Check external I/O hook FIRST (Atari ST MFP uses odd addresses)
+    if (s_io_read_hook) {
+        bool handled = false;
+        uint32_t val = s_io_read_hook(addr, 2, &handled);
+        if (handled) return (uint16_t)val;
     }
     
-    // Check if address is in bus I/O range
+    // Check if address is in bus I/O range (I/O requires alignment)
     if (addr >= BUS_IO_BASE && addr < (BUS_IO_BASE + BUS_IO_SIZE)) {
+        if (addr & 1) {
+            ESP_LOGW(TAG, "Address Error: read word from odd I/O $%06lX at PC=$%06lX",
+                     (unsigned long)addr, (unsigned long)cpu->last_pc);
+            raise_group0_exception(VEC_ADDRESS_ERROR, addr, true);
+            return 0;
+        }
+        recovery_state.last_io_access = cpu->cycles;
         return (uint16_t)bus_io_read(addr, 2);
     }
     
+    // RAM: allow unaligned access (68020+ behavior, needed for GCC-compiled code)
     if (addr < cpu->ram_size - 1) {
         return (cpu->memory[addr] << 8) | cpu->memory[addr + 1];
     }
 
-    // Enhanced logging for PC corruption detection
-    uint16_t inst = (cpu->last_pc < cpu->ram_size-1) ?
-                    ((cpu->memory[cpu->last_pc] << 8) | cpu->memory[cpu->last_pc + 1]) : 0;
-    
-    // Save crash context for post-mortem debugging
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Read word from invalid address: 0x%08lX", (unsigned long)addr);
-    save_crash_context(addr, msg, 1); // Bus error
-    
-    ESP_LOGE(TAG, "FATAL: Read word from invalid address: 0x%08lX (PC corruption detected)", (unsigned long)addr);
-    ESP_LOGE(TAG, "  Last PC: 0x%08lX, instruction: 0x%04X", (unsigned long)cpu->last_pc, inst);
-    ESP_LOGE(TAG, "  Current PC=0x%08lX SP=0x%08lX SR=0x%04X", (unsigned long)cpu->pc, (unsigned long)cpu->a[7], cpu->sr);
-    ESP_LOGE(TAG, "  Registers: D0=0x%08lX D1=0x%08lX A0=0x%08lX A1=0x%08lX", 
-             (unsigned long)cpu->d[0], (unsigned long)cpu->d[1], (unsigned long)cpu->a[0], (unsigned long)cpu->a[1]);
-    ESP_LOGE(TAG, "Crash context saved. Use 'crash' command to examine memory.");
-    
-    if (!try_exception_recovery(1)) {
-        cpu->halted = true;
-        cpu->running = false;
-    }
-    return 0x4E71;  // Return NOP instruction to prevent further damage
+    // Out-of-bounds read: generate Bus Error exception
+    ESP_LOGW(TAG, "Bus Error: read word from $%06lX at PC=$%06lX (beyond RAM)",
+             (unsigned long)addr, (unsigned long)cpu->last_pc);
+    raise_group0_exception(VEC_BUS_ERROR, addr, true);
+    return 0;
 }
 
 static inline uint32_t read_long(uint32_t addr) {
@@ -427,26 +549,26 @@ static inline uint32_t read_long(uint32_t addr) {
     // Mark GC access
     gc_mark_access(addr);
     
-    // M68K: Long access to odd address triggers Address Error exception
-    if (addr & 1) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Read long from odd address 0x%08lX at PC=0x%08lX", (unsigned long)addr, (unsigned long)cpu->last_pc);
-        ESP_LOGE(TAG, "%s", msg);
-        ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        
-        save_crash_context(addr, msg, 2); // Address error
-        
-        if (!try_exception_recovery(2)) {
-            cpu->halted = true;
-        }
-        return 0;
+    // Check external I/O hook FIRST (Atari ST MFP uses odd addresses)
+    if (s_io_read_hook) {
+        bool handled = false;
+        uint32_t val = s_io_read_hook(addr, 4, &handled);
+        if (handled) return val;
     }
     
-    // Check if address is in bus I/O range
+    // Check if address is in bus I/O range (I/O requires alignment)
     if (addr >= BUS_IO_BASE && addr < (BUS_IO_BASE + BUS_IO_SIZE)) {
+        if (addr & 1) {
+            ESP_LOGW(TAG, "Address Error: read long from odd I/O $%06lX at PC=$%06lX",
+                     (unsigned long)addr, (unsigned long)cpu->last_pc);
+            raise_group0_exception(VEC_ADDRESS_ERROR, addr, true);
+            return 0;
+        }
+        recovery_state.last_io_access = cpu->cycles;
         return bus_io_read(addr, 4);
     }
     
+    // RAM: allow unaligned access (68020+ behavior, needed for GCC-compiled code)
     if (addr < cpu->ram_size - 3) {
         return (cpu->memory[addr] << 24) |
                (cpu->memory[addr + 1] << 16) |
@@ -454,14 +576,24 @@ static inline uint32_t read_long(uint32_t addr) {
                cpu->memory[addr + 3];
     }
 
-    ESP_LOGW(TAG, "Read long from invalid address: 0x%08X (PC was: 0x%08X)", addr, cpu->last_pc);
-    return 0xFFFFFFFF;
+    // Out-of-bounds read: generate Bus Error exception
+    ESP_LOGW(TAG, "Bus Error: read long from $%06lX at PC=$%06lX (beyond RAM)",
+             (unsigned long)addr, (unsigned long)cpu->last_pc);
+    raise_group0_exception(VEC_BUS_ERROR, addr, true);
+    return 0;
 }
 
 static inline void write_byte(uint32_t addr, uint8_t value) {
     addr &= M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
+    // Check external I/O hook first (Atari ST, etc.)
+    if (s_io_write_hook) {
+        bool handled = false;
+        s_io_write_hook(addr, value, 1, &handled);
+        if (handled) return;
+    }
     // Check if address is in bus I/O range
     if (addr >= BUS_IO_BASE && addr < (BUS_IO_BASE + BUS_IO_SIZE)) {
+        recovery_state.last_io_access = cpu->cycles;  // Mark I/O access
         bus_io_write(addr, value, 1);
         return;
     }
@@ -480,34 +612,34 @@ static inline void write_word(uint32_t addr, uint16_t value) {
     // Mark GC access
     gc_mark_access(addr);
     
-    // M68K: Word access to odd address triggers Address Error exception
-    if (addr & 1) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Write word to odd address 0x%08lX at PC=0x%08lX (value=0x%04X)", 
-                 (unsigned long)addr, (unsigned long)cpu->last_pc, value);
-        ESP_LOGE(TAG, "%s", msg);
-        ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        
-        save_crash_context(addr, msg, 2); // Address error
-        
-        if (!try_exception_recovery(2)) {
-            cpu->halted = true;
-        }
-        return;
+    // Check external I/O hook FIRST (Atari ST MFP uses odd addresses)
+    if (s_io_write_hook) {
+        bool handled = false;
+        s_io_write_hook(addr, value, 2, &handled);
+        if (handled) return;
     }
     
-    // Check if address is in bus I/O range
+    // Check if address is in bus I/O range (I/O requires alignment)
     if (addr >= BUS_IO_BASE && addr < (BUS_IO_BASE + BUS_IO_SIZE)) {
+        if (addr & 1) {
+            ESP_LOGW(TAG, "Address Error: write word to odd I/O $%06lX at PC=$%06lX (val=$%04X)",
+                     (unsigned long)addr, (unsigned long)cpu->last_pc, value);
+            raise_group0_exception(VEC_ADDRESS_ERROR, addr, false);
+            return;
+        }
+        recovery_state.last_io_access = cpu->cycles;
         bus_io_write(addr, value, 2);
         return;
     }
     
+    // RAM: allow unaligned access (68020+ behavior, needed for GCC-compiled code)
     if (addr < cpu->ram_size - 1) {
         cpu->memory[addr] = value >> 8;
         cpu->memory[addr + 1] = value & 0xFF;
     } else {
-        ESP_LOGW(TAG, "Write word to invalid address: 0x%08X (PC was: 0x%08X, value: 0x%04X)",
-                 addr, cpu->last_pc, value);
+        ESP_LOGW(TAG, "Bus Error: write word to $%06lX at PC=$%06lX (val=$%04X, beyond RAM)",
+                 (unsigned long)addr, (unsigned long)cpu->last_pc, value);
+        raise_group0_exception(VEC_BUS_ERROR, addr, false);
     }
 }
 
@@ -517,36 +649,36 @@ static inline void write_long(uint32_t addr, uint32_t value) {
     // Mark GC access
     gc_mark_access(addr);
     
-    // M68K: Long access to odd address triggers Address Error exception
-    if (addr & 1) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "ADDRESS ERROR: Write long to odd address 0x%08lX at PC=0x%08lX (value=0x%08lX)", 
-                 (unsigned long)addr, (unsigned long)cpu->last_pc, (unsigned long)value);
-        ESP_LOGE(TAG, "%s", msg);
-        ESP_LOGE(TAG, "This would trigger Address Error exception (vector 3) on real M68K");
-        
-        save_crash_context(addr, msg, 2); // Address error
-        
-        if (!try_exception_recovery(2)) {
-            cpu->halted = true;
-        }
-        return;
+    // Check external I/O hook FIRST (Atari ST MFP uses odd addresses)
+    if (s_io_write_hook) {
+        bool handled = false;
+        s_io_write_hook(addr, value, 4, &handled);
+        if (handled) return;
     }
     
-    // Check if address is in bus I/O range
+    // Check if address is in bus I/O range (I/O requires alignment)
     if (addr >= BUS_IO_BASE && addr < (BUS_IO_BASE + BUS_IO_SIZE)) {
+        if (addr & 1) {
+            ESP_LOGW(TAG, "Address Error: write long to odd I/O $%06lX at PC=$%06lX (val=$%08lX)",
+                     (unsigned long)addr, (unsigned long)cpu->last_pc, (unsigned long)value);
+            raise_group0_exception(VEC_ADDRESS_ERROR, addr, false);
+            return;
+        }
+        recovery_state.last_io_access = cpu->cycles;
         bus_io_write(addr, value, 4);
         return;
     }
     
+    // RAM: allow unaligned access (68020+ behavior, needed for GCC-compiled code)
     if (addr < cpu->ram_size - 3) {
         cpu->memory[addr] = (value >> 24) & 0xFF;
         cpu->memory[addr + 1] = (value >> 16) & 0xFF;
         cpu->memory[addr + 2] = (value >> 8) & 0xFF;
         cpu->memory[addr + 3] = value & 0xFF;
     } else {
-        ESP_LOGW(TAG, "Write long to invalid address: 0x%08X (PC was: 0x%08X, value: 0x%08X)",
-                 addr, cpu->last_pc, value);
+        ESP_LOGW(TAG, "Bus Error: write long to $%06lX at PC=$%06lX (val=$%08lX, beyond RAM)",
+                 (unsigned long)addr, (unsigned long)cpu->last_pc, (unsigned long)value);
+        raise_group0_exception(VEC_BUS_ERROR, addr, false);
     }
 }
 
@@ -586,23 +718,113 @@ static inline void set_flags_nz(uint32_t value, int size) {
 
 // Exception handling
 static void raise_exception(uint32_t vector) {
-    if (!test_flag(SR_S)) {
+    // IMPORTANT: Save the OLD SR before modifying any flags.
+    // On real 68000, the stacked SR reflects the state BEFORE the exception.
+    uint16_t old_sr = cpu->sr;
+    
+    if (!(old_sr & SR_S)) {
         // Switch to supervisor mode
         cpu->usp = cpu->a[7];
         cpu->a[7] = cpu->ssp;
-        set_flag(SR_S);
+        cpu->sr |= SR_S;
     }
     
-    // Push PC and SR
+    // Push PC and SR (using the OLD SR value, not the modified one)
     cpu->a[7] -= 4;
     write_long(cpu->a[7], cpu->pc);
     cpu->a[7] -= 2;
-    write_word(cpu->a[7], cpu->sr);
+    write_word(cpu->a[7], old_sr);
     
-    // Load exception vector
-    cpu->pc = read_long(vector);
+    // Clear trace flag after saving old SR
+    cpu->sr &= ~SR_T;
     
-    ESP_LOGD(TAG, "Exception: vector=0x%08X, new PC=0x%08X", vector, cpu->pc);
+    // Load exception vector and validate handler address
+    uint32_t handler = read_long(vector);
+    handler &= M68K_ADDRESS_MASK;
+    if (handler == 0 || (handler & 1) || handler >= cpu->ram_size) {
+        ESP_LOGE(TAG, "Exception vec=$%02lX: handler=$%06lX is invalid - CPU halted",
+                 (unsigned long)vector, (unsigned long)handler);
+        cpu->halted = true;
+        cpu->running = false;
+        return;
+    }
+    cpu->pc = handler;
+    
+    ESP_LOGD(TAG, "Exception: vector=0x%08X, new PC=0x%08X, saved SR=0x%04X", vector, cpu->pc, old_sr);
+}
+
+// Group 0 Exception (Bus Error / Address Error) - extended 14-byte stack frame
+// 68000 pushes: Function Code (2) + Access Address (4) + IR (2) + SR (2) + PC (4)
+static void raise_group0_exception(uint32_t vector, uint32_t access_addr, bool is_read) {
+    if (in_group0) {
+        // Double bus fault: exception during exception processing - halt CPU
+        ESP_LOGE(TAG, "DOUBLE BUS FAULT at $%06lX accessing $%06lX - CPU halted",
+                 (unsigned long)cpu->pc, (unsigned long)access_addr);
+        cpu->halted = true;
+        in_group0 = false;  // Reset flag so recovery can work
+        return;
+    }
+    in_group0 = true;
+
+    uint16_t old_sr = cpu->sr;
+    uint16_t ir = (cpu->last_pc < cpu->ram_size - 1) ?
+                  ((cpu->memory[cpu->last_pc] << 8) | cpu->memory[cpu->last_pc + 1]) : 0;
+
+    if (!(old_sr & SR_S)) {
+        cpu->usp = cpu->a[7];
+        cpu->a[7] = cpu->ssp;
+        cpu->sr |= SR_S;
+    }
+
+    // Push extended frame (14 bytes total):
+    // SP layout after push: [FC word][Access Addr][IR][SR][PC]
+    cpu->a[7] -= 4;
+    write_long(cpu->a[7], cpu->pc);         // Program Counter
+    cpu->a[7] -= 2;
+    write_word(cpu->a[7], old_sr);           // Status Register
+    cpu->a[7] -= 2;
+    write_word(cpu->a[7], ir);               // Instruction Register
+    cpu->a[7] -= 4;
+    write_long(cpu->a[7], access_addr);      // Access Address
+    cpu->a[7] -= 2;
+    // Function code: bit 4 = R/W (1=read, 0=write), bits 2-0 = FC
+    uint16_t fc = is_read ? 0x10 : 0x00;
+    fc |= (old_sr & SR_S) ? 0x05 : 0x01;    // Supervisor/User data access
+    write_word(cpu->a[7], fc);
+
+    cpu->sr &= ~SR_T;
+    uint32_t handler = read_long(vector);
+    handler &= M68K_ADDRESS_MASK;
+
+    // Validate exception handler address
+    if (handler == 0 || handler >= cpu->ram_size) {
+        ESP_LOGE(TAG, "Group 0 exception: vec=$%02lX, handler=$%06lX is INVALID (no handler installed)",
+                 (unsigned long)vector, (unsigned long)handler);
+        ESP_LOGE(TAG, "  Faulting access=$%06lX %s, from PC=$%06lX",
+                 (unsigned long)access_addr, is_read ? "read" : "write",
+                 (unsigned long)cpu->pc);
+        ESP_LOGE(TAG, "  CPU halted - install exception vectors or fix the faulting code");
+        cpu->halted = true;
+        cpu->running = false;
+        in_group0 = false;
+        return;
+    }
+    if (handler & 1) {
+        ESP_LOGE(TAG, "Group 0 exception: vec=$%02lX, handler=$%06lX is ODD - double fault, CPU halted",
+                 (unsigned long)vector, (unsigned long)handler);
+        cpu->halted = true;
+        cpu->running = false;
+        in_group0 = false;
+        return;
+    }
+    cpu->pc = handler;
+
+    ESP_LOGW(TAG, "Group 0 exception: vec=$%02lX, access=$%06lX %s, PC→$%06lX",
+             (unsigned long)vector, (unsigned long)access_addr,
+             is_read ? "read" : "write", (unsigned long)cpu->pc);
+
+    cpu->cycles += 50;
+    in_group0 = false;
 }
 
 // Condition code tests
@@ -829,7 +1051,8 @@ static uint32_t get_ea_value(uint16_t mode, uint16_t reg, int size) {
             return 0;
     }
     
-    // Read from memory
+    // Read from memory - save address for potential writeback
+    s_last_ea_addr = addr;
     if (size == 1) return read_byte(addr);
     if (size == 2) return read_word(addr);
     if (size == 4) return read_long(addr);
@@ -915,6 +1138,30 @@ static void set_ea_value(uint16_t mode, uint16_t reg, int size, uint32_t value) 
     else if (size == 4) write_long(addr, value);
 }
 
+// Write back to the same EA that was last read by get_ea_value().
+// CRITICAL: For read-modify-write instructions (NEG, NOT, ORI, ANDI, SUBI, ADDI,
+// EORI, EOR, ADD/SUB/AND/OR to EA, ADDQ/SUBQ, TAS, NBCD, NEGX), we must NOT 
+// call set_ea_value() after get_ea_value() because:
+//   - Modes 3/4: An would be incremented/decremented a SECOND time
+//   - Modes 5/6/7: Extension words would be re-fetched from wrong PC position
+// This function writes to the address saved by get_ea_value() without side effects.
+static void set_ea_value_writeback(uint16_t mode, uint16_t reg, int size, uint32_t value) {
+    if (mode == 0) {
+        // Data register - direct write
+        if (size == 1) cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | (value & 0xFF);
+        else if (size == 2) cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | (value & 0xFFFF);
+        else cpu->d[reg] = value;
+    } else if (mode == 1) {
+        // Address register - direct write
+        cpu->a[reg] = value;
+    } else {
+        // Memory modes - write to the address from the last get_ea_value() call
+        if (size == 1) write_byte(s_last_ea_addr, value);
+        else if (size == 2) write_word(s_last_ea_addr, value);
+        else write_long(s_last_ea_addr, value);
+    }
+}
+
 // Instruction implementations
 static void exec_move(uint16_t opcode) {
     int size = ((opcode >> 12) & 3);
@@ -962,7 +1209,7 @@ static void exec_add(uint16_t opcode) {
         src = cpu->d[reg] & mask;
         dst = get_ea_value(mode, ea_reg, size);
         result = (src + dst) & mask;
-        set_ea_value(mode, ea_reg, size, result);
+        set_ea_value_writeback(mode, ea_reg, size, result);
     } else {
         // Dn = Dn + EA
         src = get_ea_value(mode, ea_reg, size);
@@ -1009,7 +1256,7 @@ static void exec_sub(uint16_t opcode) {
         src = cpu->d[reg] & mask;
         dst = get_ea_value(mode, ea_reg, size);
         result = (dst - src) & mask;
-        set_ea_value(mode, ea_reg, size, result);
+        set_ea_value_writeback(mode, ea_reg, size, result);
     } else {
         // Dn = Dn - EA
         src = get_ea_value(mode, ea_reg, size);
@@ -1086,7 +1333,7 @@ static void exec_and(uint16_t opcode) {
         uint32_t result = cpu->d[reg] & dst;
         if (size == 1) result &= 0xFF;
         else if (size == 2) result &= 0xFFFF;
-        set_ea_value(mode, ea_reg, size, result);
+        set_ea_value_writeback(mode, ea_reg, size, result);
         set_flags_nz(result, size);
     } else {
         // Dn = Dn & EA
@@ -1121,7 +1368,7 @@ static void exec_or(uint16_t opcode) {
         uint32_t result = cpu->d[reg] | dst;
         if (size == 1) result &= 0xFF;
         else if (size == 2) result &= 0xFFFF;
-        set_ea_value(mode, ea_reg, size, result);
+        set_ea_value_writeback(mode, ea_reg, size, result);
         set_flags_nz(result, size);
     } else {
         // Dn = Dn | EA
@@ -1213,7 +1460,7 @@ static void exec_neg(uint16_t opcode) {
     uint32_t src = get_ea_value(mode, reg, size);
     uint32_t result = 0 - src;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     set_flags_nz(result, size);
     
     if (src != 0) set_flag(SR_C | SR_X);
@@ -1237,7 +1484,7 @@ static void exec_not(uint16_t opcode) {
     if (size == 1) result &= 0xFF;
     else if (size == 2) result &= 0xFFFF;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     set_flags_nz(result, size);
     clear_flag(SR_V | SR_C);
     cpu->cycles += 4;
@@ -1296,7 +1543,7 @@ static void exec_ori(uint16_t opcode) {
     uint32_t dst = get_ea_value(mode, reg, size);
     uint32_t result = dst | imm;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     set_flags_nz(result, size);
     clear_flag(SR_V | SR_C);
     cpu->cycles += (mode == 0) ? 8 : 12;
@@ -1321,7 +1568,7 @@ static void exec_andi(uint16_t opcode) {
     uint32_t dst = get_ea_value(mode, reg, size);
     uint32_t result = dst & imm;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     set_flags_nz(result, size);
     clear_flag(SR_V | SR_C);
     cpu->cycles += (mode == 0) ? 8 : 12;
@@ -1349,7 +1596,7 @@ static void exec_subi(uint16_t opcode) {
     uint32_t dst = get_ea_value(mode, reg, size) & mask;
     uint32_t result = (dst - src) & mask;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     set_flags_nz(result, size);
     
     // Carry/Borrow
@@ -1388,7 +1635,7 @@ static void exec_addi(uint16_t opcode) {
     uint32_t dst = get_ea_value(mode, reg, size) & mask;
     uint32_t result = (src + dst) & mask;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     set_flags_nz(result, size);
     
     // Carry
@@ -1424,7 +1671,7 @@ static void exec_eori(uint16_t opcode) {
     uint32_t dst = get_ea_value(mode, reg, size);
     uint32_t result = dst ^ imm;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     set_flags_nz(result, size);
     clear_flag(SR_V | SR_C);
     cpu->cycles += (mode == 0) ? 8 : 12;
@@ -1486,7 +1733,7 @@ static void exec_eor(uint16_t opcode) {
     if (size == 1) result &= 0xFF;
     else if (size == 2) result &= 0xFFFF;
     
-    set_ea_value(mode, ea_reg, size, result);
+    set_ea_value_writeback(mode, ea_reg, size, result);
     set_flags_nz(result, size);
     clear_flag(SR_V | SR_C);
     cpu->cycles += 4;
@@ -1583,32 +1830,43 @@ static void exec_asl(uint16_t opcode) {
 
     int size = (size_mode == 0) ? 1 : (size_mode == 1) ? 2 : 4;
     uint8_t count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
+    uint32_t bits = size * 8;
 
     uint32_t value = cpu->d[reg];
     if (size == 1) value &= 0xFF;
     else if (size == 2) value &= 0xFFFF;
 
-    uint32_t result = value << count;
+    uint32_t result;
+    if (count == 0) {
+        result = value;
+        clear_flag(SR_C);
+        // X not affected when count=0
+    } else if (count >= bits) {
+        result = 0;
+        // Last bit shifted out: if count==bits, it's the original LSB
+        if (count == bits && (value & 1)) set_flag(SR_C | SR_X);
+        else if (count > bits) clear_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    } else {
+        result = value << count;
+        // C/X = last bit shifted out = bit (bits - count) of original value
+        if (value & (1u << (bits - count))) set_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    }
+
+    uint32_t mask_val = (bits == 32) ? 0xFFFFFFFF : ((1u << bits) - 1);
+    result &= mask_val;
 
     if (size == 1) {
-        result &= 0xFF;
         cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | result;
     } else if (size == 2) {
-        result &= 0xFFFF;
         cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | result;
     } else {
         cpu->d[reg] = result;
     }
     set_flags_nz(result, size);
-
-    if (count > 0) {
-        uint32_t msb_pos = size * 8 - 1;
-        if (count <= msb_pos && (value & (1 << (msb_pos - count + 1)))) {
-            set_flag(SR_C | SR_X);
-        } else {
-            clear_flag(SR_C | SR_X);
-        }
-    }
+    // V set if MSB changed at any time during the shift (simplified)
+    clear_flag(SR_V);
 
     cpu->cycles += 6 + 2 * count;
 }
@@ -1620,12 +1878,28 @@ static void exec_lsr(uint16_t opcode) {
     
     int size = (size_mode == 0) ? 1 : (size_mode == 1) ? 2 : 4;
     uint8_t count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
+    uint32_t bits = size * 8;
     
     uint32_t value = cpu->d[reg];
     if (size == 1) value &= 0xFF;
     else if (size == 2) value &= 0xFFFF;
     
-    uint32_t result = value >> count;
+    uint32_t result;
+    if (count == 0) {
+        result = value;
+        clear_flag(SR_C);
+        // X not affected when count=0
+    } else if (count >= bits) {
+        result = 0;
+        // Last bit shifted out
+        if (count == bits && (value & (1u << (bits - 1)))) set_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    } else {
+        result = value >> count;
+        // C/X = last bit shifted out = bit (count-1) of original value
+        if (value & (1u << (count - 1))) set_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    }
     
     if (size == 1) cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | result;
     else if (size == 2) cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | result;
@@ -1633,16 +1907,6 @@ static void exec_lsr(uint16_t opcode) {
     
     set_flags_nz(result, size);
     clear_flag(SR_V);
-    
-    if (count > 0) {
-        if (value & (1 << (count - 1))) {
-            set_flag(SR_C | SR_X);
-        } else {
-            clear_flag(SR_C | SR_X);
-        }
-    } else {
-        clear_flag(SR_C);
-    }
     
     cpu->cycles += 6 + 2 * count;
 }
@@ -1654,37 +1918,49 @@ static void exec_asr(uint16_t opcode) {
     
     int size = (size_mode == 0) ? 1 : (size_mode == 1) ? 2 : 4;
     uint8_t count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
+    uint32_t bits = size * 8;
     
     int32_t value;
     if (size == 1) value = (int8_t)(cpu->d[reg] & 0xFF);
     else if (size == 2) value = (int16_t)(cpu->d[reg] & 0xFFFF);
     else value = (int32_t)cpu->d[reg];
     
-    uint32_t orig_value = value;
-    int32_t result = value >> count;
+    uint32_t orig_unsigned;
+    if (size == 1) orig_unsigned = (uint8_t)value;
+    else if (size == 2) orig_unsigned = (uint16_t)value;
+    else orig_unsigned = (uint32_t)value;
+    
+    int32_t result;
+    if (count == 0) {
+        result = value;
+        clear_flag(SR_C);
+        // X not affected when count=0
+    } else if (count >= bits) {
+        // ASR fills with sign bit, so result is all 0s or all 1s
+        result = (value < 0) ? -1 : 0;
+        // Last bit shifted out = sign bit for count >= bits
+        if (value < 0) set_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    } else {
+        result = value >> count;
+        // C/X = last bit shifted out = bit (count-1) of original value
+        if (orig_unsigned & (1u << (count - 1))) set_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    }
+    
+    uint32_t mask_val = (bits == 32) ? 0xFFFFFFFF : ((1u << bits) - 1);
+    result &= mask_val;
     
     if (size == 1) {
-        result &= 0xFF;
-        cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | result;
+        cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | (result & 0xFF);
     } else if (size == 2) {
-        result &= 0xFFFF;
-        cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | result;
+        cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | (result & 0xFFFF);
     } else {
         cpu->d[reg] = result;
     }
     
     set_flags_nz(result, size);
     clear_flag(SR_V);
-    
-    if (count > 0) {
-        if (orig_value & (1 << (count - 1))) {
-            set_flag(SR_C | SR_X);
-        } else {
-            clear_flag(SR_C | SR_X);
-        }
-    } else {
-        clear_flag(SR_C);
-    }
     
     cpu->cycles += 6 + 2 * count;
 }
@@ -1696,19 +1972,35 @@ static void exec_lsl(uint16_t opcode) {
     
     int size = (size_mode == 0) ? 1 : (size_mode == 1) ? 2 : 4;
     uint8_t count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
+    uint32_t bits = size * 8;
     
     uint32_t value = cpu->d[reg];
     if (size == 1) value &= 0xFF;
     else if (size == 2) value &= 0xFFFF;
     
-    uint32_t msb_pos = (size == 1) ? 7 : (size == 2) ? 15 : 31;
-    uint32_t result = value << count;
+    uint32_t result;
+    if (count == 0) {
+        result = value;
+        clear_flag(SR_C);
+        // X not affected when count=0
+    } else if (count >= bits) {
+        result = 0;
+        // Last bit shifted out
+        if (count == bits && (value & 1)) set_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    } else {
+        result = value << count;
+        // C/X = last bit shifted out = bit (bits - count) of original value
+        if (value & (1u << (bits - count))) set_flag(SR_C | SR_X);
+        else clear_flag(SR_C | SR_X);
+    }
+    
+    uint32_t mask_val = (bits == 32) ? 0xFFFFFFFF : ((1u << bits) - 1);
+    result &= mask_val;
     
     if (size == 1) {
-        result &= 0xFF;
         cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | result;
     } else if (size == 2) {
-        result &= 0xFFFF;
         cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | result;
     } else {
         cpu->d[reg] = result;
@@ -1716,16 +2008,6 @@ static void exec_lsl(uint16_t opcode) {
     
     set_flags_nz(result, size);
     clear_flag(SR_V);
-    
-    if (count > 0) {
-        if (value & (1 << (msb_pos - count + 1))) {
-            set_flag(SR_C | SR_X);
-        } else {
-            clear_flag(SR_C | SR_X);
-        }
-    } else {
-        clear_flag(SR_C);
-    }
     
     cpu->cycles += 6 + 2 * count;
 }
@@ -1736,15 +2018,20 @@ static void exec_rol(uint16_t opcode) {
     uint16_t size_mode = (opcode >> 6) & 3;
     
     int size = (size_mode == 0) ? 1 : (size_mode == 1) ? 2 : 4;
-    uint8_t count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
+    uint8_t orig_count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
     
     uint32_t value = cpu->d[reg];
     uint32_t bits = size * 8;
     uint32_t mask = (size == 1) ? 0xFF : (size == 2) ? 0xFFFF : 0xFFFFFFFF;
     value &= mask;
     
-    count %= bits;
-    uint32_t result = ((value << count) | (value >> (bits - count))) & mask;
+    uint8_t count = orig_count % bits;
+    uint32_t result;
+    if (count == 0) {
+        result = value;
+    } else {
+        result = ((value << count) | (value >> (bits - count))) & mask;
+    }
     
     if (size == 1) cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | result;
     else if (size == 2) cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | result;
@@ -1753,14 +2040,14 @@ static void exec_rol(uint16_t opcode) {
     set_flags_nz(result, size);
     clear_flag(SR_V);
     
-    if (count > 0) {
+    if (orig_count > 0) {
         if (result & 1) set_flag(SR_C);
         else clear_flag(SR_C);
     } else {
         clear_flag(SR_C);
     }
     
-    cpu->cycles += 6 + 2 * count;
+    cpu->cycles += 6 + 2 * orig_count;
 }
 
 static void exec_ror(uint16_t opcode) {
@@ -1769,15 +2056,20 @@ static void exec_ror(uint16_t opcode) {
     uint16_t size_mode = (opcode >> 6) & 3;
     
     int size = (size_mode == 0) ? 1 : (size_mode == 1) ? 2 : 4;
-    uint8_t count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
+    uint8_t orig_count = (opcode & 0x20) ? (cpu->d[count_reg] & 63) : ((count_reg == 0) ? 8 : count_reg);
     
     uint32_t value = cpu->d[reg];
     uint32_t bits = size * 8;
     uint32_t mask = (size == 1) ? 0xFF : (size == 2) ? 0xFFFF : 0xFFFFFFFF;
     value &= mask;
     
-    count %= bits;
-    uint32_t result = ((value >> count) | (value << (bits - count))) & mask;
+    uint8_t count = orig_count % bits;
+    uint32_t result;
+    if (count == 0) {
+        result = value;
+    } else {
+        result = ((value >> count) | (value << (bits - count))) & mask;
+    }
     
     if (size == 1) cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | result;
     else if (size == 2) cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | result;
@@ -1786,7 +2078,7 @@ static void exec_ror(uint16_t opcode) {
     set_flags_nz(result, size);
     clear_flag(SR_V);
     
-    if (count > 0) {
+    if (orig_count > 0) {
         uint32_t msb = (size == 1) ? 0x80 : (size == 2) ? 0x8000 : 0x80000000;
         if (result & msb) set_flag(SR_C);
         else clear_flag(SR_C);
@@ -1794,7 +2086,7 @@ static void exec_ror(uint16_t opcode) {
         clear_flag(SR_C);
     }
     
-    cpu->cycles += 6 + 2 * count;
+    cpu->cycles += 6 + 2 * orig_count;
 }
 
 static void exec_roxl(uint16_t opcode) {
@@ -2145,7 +2437,7 @@ static void exec_nbcd(uint16_t opcode) {
     
     uint8_t result = (high << 4) | (low & 0x0F);
     
-    set_ea_value(mode, reg, 1, result);
+    set_ea_value_writeback(mode, reg, 1, result);
     
     if (result != 0) clear_flag(SR_Z);
     if (borrow) set_flag(SR_C | SR_X);
@@ -2170,7 +2462,7 @@ static void exec_negx(uint16_t opcode) {
     uint32_t x_val = test_flag(SR_X) ? 1 : 0;
     uint32_t result = (0 - src - x_val) & mask;
     
-    set_ea_value(mode, reg, size, result);
+    set_ea_value_writeback(mode, reg, size, result);
     
     if (result != 0) clear_flag(SR_Z);
     if (result & msb) set_flag(SR_N);
@@ -2202,13 +2494,18 @@ static void exec_movem_to_mem(uint16_t opcode) {
         for (int i = 0; i < 16; i++) {
             if (mask & (1 << i)) {
                 addr -= size;
+                addr &= M68K_ADDRESS_MASK;  // Prevent underflow wrap
+                if (addr >= cpu->ram_size) {
+                    // Stack underflow - raise address error
+                    raise_group0_exception(VEC_ADDRESS_ERROR, addr, false);
+                    cpu->cycles += 8;
+                    return;
+                }
                 if (i < 8) {
-                    // bits 0-7: address registers A7 down to A0
                     int areg = 7 - i;
                     if (size == 4) write_long(addr, cpu->a[areg]);
                     else write_word(addr, cpu->a[areg] & 0xFFFF);
                 } else {
-                    // bits 8-15: data registers D7 down to D0
                     int dreg = 15 - i;
                     if (size == 4) write_long(addr, cpu->d[dreg]);
                     else write_word(addr, cpu->d[dreg] & 0xFFFF);
@@ -2277,18 +2574,28 @@ static void exec_trap(uint16_t opcode) {
 }
 
 static void exec_rte(void) {
+    // Pre-validate stack pointer before restoring from exception frame
+    uint32_t sp = cpu->a[7] & M68K_ADDRESS_MASK;
+    if ((sp & 1) || sp + 6 > cpu->ram_size) {
+        ESP_LOGE(TAG, "RTE: Invalid stack pointer A7=0x%08lX - cannot restore exception frame",
+                 (unsigned long)cpu->a[7]);
+        raise_group0_exception(VEC_ADDRESS_ERROR, sp, true);
+        cpu->cycles += 20;
+        return;
+    }
+
     // Return from exception
     cpu->sr = read_word(cpu->a[7]);
     cpu->a[7] += 2;
     cpu->pc = read_long(cpu->a[7]);
     cpu->a[7] += 4;
-    
+
     // Restore stack pointer if switching modes
     if (!test_flag(SR_S)) {
         cpu->ssp = cpu->a[7];
         cpu->a[7] = cpu->usp;
     }
-    
+
     cpu->cycles += 20;
 }
 
@@ -2402,15 +2709,74 @@ static void exec_bcc(uint8_t condition, int8_t disp8) {
 
 // Main execution step
 static bool execute_instruction(void) {
-    if (cpu->halted || cpu->stopped) {
+    if (cpu->halted) {
+        return false;
+    }
+    if (cpu->stopped) {
+        // Advance cycles while stopped so watchdog/timeout can fire
+        cpu->cycles += 100;
+        // Check STOP timeout: if stopped for >10 seconds worth of cycles, halt
+        if (recovery_state.stop_cycles > 0 &&
+            (cpu->cycles - recovery_state.stop_cycles) > (uint64_t)M68K_CPU_FREQ_MHZ * 10000000ULL) {
+            ESP_LOGW(TAG, "STOP timeout: CPU stopped for >10s at PC=0x%08lX SR=0x%04X",
+                     (unsigned long)cpu->pc, cpu->sr);
+            cpu->halted = true;
+        }
         return false;
     }
     
-    // Reset watchdog on every instruction (track PC changes)
-    recovery_state.watchdog_cycles = cpu->cycles;
-    recovery_state.watchdog_pc = cpu->pc;
+    // Check for pending external interrupts before each instruction
+    if (cpu->pending_irq > 0) {
+        uint8_t current_mask = (cpu->sr >> 8) & 7;
+        uint8_t irq_level = cpu->pending_irq;
+        
+        // Interrupt accepted if level > current mask, or level 7 (NMI always accepted)
+        if (irq_level > current_mask || irq_level == 7) {
+            // IMPORTANT: Save the OLD SR before modifying any flags.
+            // On real 68000, the stacked SR reflects the state BEFORE the interrupt.
+            uint16_t old_sr = cpu->sr;
+            
+            // Save state - switch to supervisor mode if needed
+            if (!(old_sr & SR_S)) {
+                cpu->usp = cpu->a[7];
+                cpu->a[7] = cpu->ssp;
+                cpu->sr |= SR_S;
+            }
+            
+            // Push PC and SR onto supervisor stack (using OLD SR)
+            cpu->a[7] -= 4;
+            write_long(cpu->a[7], cpu->pc);
+            cpu->a[7] -= 2;
+            write_word(cpu->a[7], old_sr);
+            
+            // Set new interrupt mask to block same and lower levels
+            cpu->sr = (cpu->sr & ~SR_I) | ((uint16_t)irq_level << 8);
+            // Clear trace flag
+            cpu->sr &= ~SR_T;
+            
+            // Get interrupt vector
+            uint8_t vector = 0;
+            if (s_irq_ack_hook) {
+                vector = s_irq_ack_hook(irq_level);
+            }
+            
+            if (vector == 0) {
+                // Autovector: vector = 24 + level
+                vector = 24 + irq_level;
+            }
+            
+            // Load PC from vector table
+            uint32_t vec_addr = vector * 4;
+            cpu->pc = read_long(vec_addr);
+            
+            ESP_LOGD(TAG, "IRQ level %d accepted: vector=%d, new PC=0x%08X", 
+                     irq_level, vector, cpu->pc);
+            
+            cpu->cycles += 44; // Interrupt processing takes ~44 cycles
+        }
+    }
     
-    // Timeout check only (every 1000 instructions for efficiency)
+    // Watchdog and timeout check (every 1000 instructions for efficiency)
     if ((cpu->instructions_executed % 1000) == 0) {
         check_watchdog();
         check_execution_timeout();
@@ -2432,11 +2798,18 @@ static bool execute_instruction(void) {
         // Show stack contents
         uint32_t sp = cpu->a[7];
         if (sp >= 4 && sp < cpu->ram_size) {
-            ESP_LOGE(TAG, "Top of stack [SP+0]: 0x%08X", read_long(sp));
-            if (sp >= 8) {
-                ESP_LOGE(TAG, "Stack [SP-4]: 0x%08X", read_long(sp - 4));
+            ESP_LOGE(TAG, "Stack dump around SP=0x%08X:", sp);
+            for (int i = -8; i <= 16; i += 4) {
+                uint32_t addr = sp + i;
+                if (addr < cpu->ram_size) {
+                    ESP_LOGE(TAG, "  [SP%+d] = 0x%08X (addr 0x%08X)", 
+                             i, read_long(addr), addr);
+                }
             }
         }
+        
+        // Dump instruction history
+        inst_history_dump();
         
         save_crash_context(cpu->pc, msg, 2); // Address error
         
@@ -2450,47 +2823,25 @@ static bool execute_instruction(void) {
     // Save PC for error reporting
     cpu->last_pc = cpu->pc;
     
-    // Check if PC is in exception vector table (indicates unhandled exception)
-    // M68K has 256 exception vectors (0x000-0x3FF), but check only vectors 2-63
-    if (cpu->pc < 0x100 && cpu->pc >= 8) {  // Vectors 2-63 (skip reset vectors 0-1)
-        uint32_t vector_num = cpu->pc / 4;
-        const char* vec_names[] = {
-            "Reset SSP", "Reset PC", "Bus Error", "Address Error",
-            "Illegal Instruction", "Divide by Zero", "CHK", "TRAPV",
-            "Privilege Violation", "Trace", "Line 1010", "Line 1111"
-        };
-        const char* vec_name = (vector_num < 12) ? vec_names[vector_num] : "Unknown";
-        
-        ESP_LOGE(TAG, "FATAL: PC in exception vector table at 0x%08X (vector %d: %s)", 
-                 cpu->pc, (int)vector_num, vec_name);
-        ESP_LOGE(TAG, "This means an exception occurred but the vector is uninitialized.");
-        ESP_LOGE(TAG, "Last valid PC was: 0x%08X", cpu->last_pc);
-        
-        // Try to determine which exception by looking at nearby PC values
-        if (cpu->pc >= 8 && cpu->pc < 12) {
-            ESP_LOGE(TAG, ">>> BUS ERROR exception - invalid memory access or alignment error");
-        } else if (cpu->pc >= 12 && cpu->pc < 16) {
-            ESP_LOGE(TAG, ">>> ADDRESS ERROR exception - odd address word/long access");
-        } else if (cpu->pc >= 16 && cpu->pc < 20) {
-            ESP_LOGE(TAG, ">>> ILLEGAL INSTRUCTION exception");
-        }
-        
-        cpu->halted = true;
-        cpu->running = false;
-        return false;
-    }
+    // Note: We do NOT halt execution when PC is in the exception vector table area
+    // ($000-$3FF). On real 68000 systems (Atari ST, Amiga), exception handlers can
+    // reside in low memory, and TOS/Kickstart copies code there during init.
+    // Halting here would prevent legitimate system software from running.
     
-    // Debug: Log first 50 instructions
-    static int exec_count = 0;
-    bool debug_this = (exec_count < 50);
+    // Debug: Log first 50 instructions after each reset
+    bool debug_this = (cpu->instructions_executed < 50);
     
     uint32_t debug_pc = cpu->pc;
     uint16_t opcode = fetch_word();
     
+    // Record in instruction history ring buffer for crash diagnostics
+    inst_history_record(debug_pc, opcode, cpu->a[7], cpu->sr);
+    
     if (debug_this) {
-        ESP_LOGI(TAG, "Exec [%d]: PC=0x%08lX, Opcode=0x%04X, SP=0x%08lX", 
-                 exec_count, (unsigned long)debug_pc, opcode, (unsigned long)cpu->a[7]);
-        exec_count++;
+        ESP_LOGI(TAG, "Exec [%lu]: PC=0x%08lX, Opcode=0x%04X, SP=0x%08lX", 
+                 (unsigned long)cpu->instructions_executed, (unsigned long)debug_pc, opcode, (unsigned long)cpu->a[7]);
+    } else if (cpu->instructions_executed == 50) {
+        ESP_LOGI(TAG, "(suppressing further instruction trace)");
     }
     
     cpu->instructions_executed++;
@@ -2527,16 +2878,85 @@ static bool execute_instruction(void) {
                     cpu->cycles += 20;
                 }
             } else if ((opcode & 0xFFC0) == 0x0800) {  // BTST immediate
-                uint8_t bit = fetch_word() & 31;
+                uint8_t bit = fetch_word() & 0xFF;
                 uint16_t mode = (opcode >> 3) & 7;
                 uint16_t reg = opcode & 7;
-                uint32_t value = get_ea_value(mode, reg, mode == 0 ? 4 : 1);
+                uint32_t value;
+                if (mode == 0) {
+                    // Data register - 32-bit, bit modulo 32
+                    bit &= 31;
+                    value = cpu->d[reg];
+                } else {
+                    // Memory - byte, bit modulo 8
+                    bit &= 7;
+                    value = get_ea_value(mode, reg, 1);
+                }
                 if (value & (1 << bit)) clear_flag(SR_Z);
                 else set_flag(SR_Z);
                 cpu->cycles += 10;
-            } else if ((opcode & 0xF000) == 0x0000 && (opcode & 0x0F00) != 0x0F00) {
+            } else if ((opcode & 0xFFC0) == 0x0840) {  // BCHG immediate
+                uint8_t bit = fetch_word() & 31;
+                uint16_t mode = (opcode >> 3) & 7;
+                uint16_t reg = opcode & 7;
+                if (mode == 0) {
+                    // Data register - 32-bit
+                    if (cpu->d[reg] & (1 << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    cpu->d[reg] ^= (1 << bit);
+                } else {
+                    // Memory - byte
+                    bit &= 7;
+                    uint32_t ea = get_ea_addr(mode, reg, 1);
+                    uint8_t val = read_byte(ea);
+                    if (val & (1 << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    write_byte(ea, val ^ (1 << bit));
+                }
+                cpu->cycles += 12;
+            } else if ((opcode & 0xFFC0) == 0x0880) {  // BCLR immediate
+                uint8_t bit = fetch_word() & 31;
+                uint16_t mode = (opcode >> 3) & 7;
+                uint16_t reg = opcode & 7;
+                if (mode == 0) {
+                    // Data register - 32-bit
+                    if (cpu->d[reg] & (1 << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    cpu->d[reg] &= ~(1 << bit);
+                } else {
+                    // Memory - byte
+                    bit &= 7;
+                    uint32_t ea = get_ea_addr(mode, reg, 1);
+                    uint8_t val = read_byte(ea);
+                    if (val & (1 << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    write_byte(ea, val & ~(1 << bit));
+                }
+                cpu->cycles += 14;
+            } else if ((opcode & 0xFFC0) == 0x08C0) {  // BSET immediate
+                uint8_t bit = fetch_word() & 31;
+                uint16_t mode = (opcode >> 3) & 7;
+                uint16_t reg = opcode & 7;
+                if (mode == 0) {
+                    // Data register - 32-bit
+                    if (cpu->d[reg] & (1 << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    cpu->d[reg] |= (1 << bit);
+                } else {
+                    // Memory - byte
+                    bit &= 7;
+                    uint32_t ea = get_ea_addr(mode, reg, 1);
+                    uint8_t val = read_byte(ea);
+                    if (val & (1 << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    write_byte(ea, val | (1 << bit));
+                }
+                cpu->cycles += 12;
+            } else if ((opcode & 0xF100) == 0x0000) {
                 // Immediate instructions: ORI, ANDI, SUBI, ADDI, EORI, CMPI
-                // Pattern: 0000 xxx0 ssaa aaaa (bits 15-12 = 0, exclude BTST/BCHG/BCLR/BSET)
+                // Pattern: 0000 xxx**0** ssmmm rrr (bits 15-12 = 0, bit 8 = 0)
+                // Bit 8 MUST be 0: all immediates have bit 8=0.
+                // Bit 8=1 opcodes are dynamic bit ops (BTST/BCHG/BCLR/BSET Dn) and MOVEP,
+                // handled below. Using (opcode & 0xF100)==0 ensures we don't steal them.
                 uint8_t op_type = (opcode >> 9) & 7;
                 switch (op_type) {
                     case 0: exec_ori(opcode); break;   // 0000 000x = ORI
@@ -2546,11 +2966,86 @@ static bool execute_instruction(void) {
                     case 5: exec_eori(opcode); break;  // 0000 101x = EORI
                     case 6: exec_cmpi(opcode); break;  // 0000 110x = CMPI
                     default:
-                        ESP_LOGW(TAG, "Unknown immediate opcode 0x%04X at PC=0x%08X", opcode, cpu->pc - 2);
+                        ESP_LOGW(TAG, "ILLEGAL immediate opcode 0x%04X at PC=0x%08X", opcode, cpu->pc - 2);
+                        cpu->pc -= 2;
+                        raise_exception(VEC_ILLEGAL);
+                        cpu->cycles += 34;
                         break;
                 }
-            } else if ((opcode & 0xF1C0) == 0x0100) {  // BTST/BCHG/BCLR/BSET Dn
-                cpu->cycles += 6;
+            } else if ((opcode & 0xF100) == 0x0100 && (opcode & 0x0038) == 0x0008) {
+                // MOVEP - Move Peripheral data (alternating bytes)
+                // 0000 rrr 1 OO 001 aaa, d16 follows
+                // Used by Atari ST TOS for MFP/ACIA byte-wide register access
+                uint16_t dn = (opcode >> 9) & 7;
+                uint16_t an = opcode & 7;
+                uint16_t op_mode = (opcode >> 6) & 3;
+                int16_t disp = (int16_t)fetch_word();
+                uint32_t addr = cpu->a[an] + disp;
+                
+                switch (op_mode) {
+                    case 0: { // MOVEP.W (d16,An),Dn - memory to register, word
+                        uint8_t hi = read_byte(addr);
+                        uint8_t lo = read_byte(addr + 2);
+                        cpu->d[dn] = (cpu->d[dn] & 0xFFFF0000) | (hi << 8) | lo;
+                        cpu->cycles += 16;
+                        break;
+                    }
+                    case 1: { // MOVEP.L (d16,An),Dn - memory to register, long
+                        uint8_t b3 = read_byte(addr);
+                        uint8_t b2 = read_byte(addr + 2);
+                        uint8_t b1 = read_byte(addr + 4);
+                        uint8_t b0 = read_byte(addr + 6);
+                        cpu->d[dn] = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+                        cpu->cycles += 24;
+                        break;
+                    }
+                    case 2: { // MOVEP.W Dn,(d16,An) - register to memory, word
+                        write_byte(addr, (cpu->d[dn] >> 8) & 0xFF);
+                        write_byte(addr + 2, cpu->d[dn] & 0xFF);
+                        cpu->cycles += 16;
+                        break;
+                    }
+                    case 3: { // MOVEP.L Dn,(d16,An) - register to memory, long
+                        write_byte(addr, (cpu->d[dn] >> 24) & 0xFF);
+                        write_byte(addr + 2, (cpu->d[dn] >> 16) & 0xFF);
+                        write_byte(addr + 4, (cpu->d[dn] >> 8) & 0xFF);
+                        write_byte(addr + 6, cpu->d[dn] & 0xFF);
+                        cpu->cycles += 24;
+                        break;
+                    }
+                }
+            } else if ((opcode & 0xF100) == 0x0100) {  // BTST/BCHG/BCLR/BSET Dn,<ea>
+                // Dynamic bit operations: bit number in Dn
+                uint16_t dn = (opcode >> 9) & 7;
+                uint16_t type = (opcode >> 6) & 3; // 0=BTST, 1=BCHG, 2=BCLR, 3=BSET
+                uint16_t mode = (opcode >> 3) & 7;
+                uint16_t reg = opcode & 7;
+                uint8_t bit = cpu->d[dn];
+                
+                if (mode == 0) {
+                    // Data register - 32-bit, bit modulo 32
+                    bit &= 31;
+                    if (cpu->d[reg] & (1u << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    switch (type) {
+                        case 1: cpu->d[reg] ^= (1u << bit); break;  // BCHG
+                        case 2: cpu->d[reg] &= ~(1u << bit); break; // BCLR
+                        case 3: cpu->d[reg] |= (1u << bit); break;  // BSET
+                    }
+                } else {
+                    // Memory - byte, bit modulo 8
+                    bit &= 7;
+                    uint32_t ea = get_ea_addr(mode, reg, 1);
+                    uint8_t val = read_byte(ea);
+                    if (val & (1 << bit)) clear_flag(SR_Z);
+                    else set_flag(SR_Z);
+                    switch (type) {
+                        case 1: write_byte(ea, val ^ (1 << bit)); break;  // BCHG
+                        case 2: write_byte(ea, val & ~(1 << bit)); break; // BCLR
+                        case 3: write_byte(ea, val | (1 << bit)); break;  // BSET
+                    }
+                }
+                cpu->cycles += (type == 0) ? 6 : 8;
             } else if ((opcode & 0xFFC0) == 0x40C0) {  // MOVE from SR
                 uint16_t mode = (opcode >> 3) & 7;
                 uint16_t reg = opcode & 7;
@@ -2602,7 +3097,7 @@ static bool execute_instruction(void) {
                 uint8_t value = get_ea_value(mode, reg, 1);
                 set_flags_nz(value, 1);
                 clear_flag(SR_V | SR_C);
-                set_ea_value(mode, reg, 1, value | 0x80);
+                set_ea_value_writeback(mode, reg, 1, value | 0x80);
                 cpu->cycles += 14;
             } else if ((opcode & 0xFF00) == 0x4A00) {  // TST (all sizes)
                 exec_tst(opcode);
@@ -2611,6 +3106,9 @@ static bool execute_instruction(void) {
                     raise_exception(VEC_PRIVILEGE);
                 } else {
                     ESP_LOGI(TAG, "RESET instruction");
+                    if (s_reset_hook) {
+                        s_reset_hook();  // Reset external hardware
+                    }
                     cpu->cycles += 132;
                 }
             } else if (opcode == 0x4E71) {  // NOP
@@ -2621,20 +3119,23 @@ static bool execute_instruction(void) {
                 } else {
                     cpu->sr = fetch_word();
                     cpu->stopped = true;
-                    ESP_LOGI(TAG, "CPU STOPPED");
+                    recovery_state.stop_cycles = cpu->cycles;  // Track when STOP entered
+                    ESP_LOGD(TAG, "CPU STOPPED (SR=$%04X)", cpu->sr);
                     cpu->cycles += 4;
                 }
             } else if (opcode == 0x4E73) {  // RTE
                 exec_rte();
             } else if (opcode == 0x4E75) {  // RTS
                 uint32_t return_addr = read_long(cpu->a[7]);
+                cpu->a[7] += 4;
                 if (return_addr & 1) {
                     ESP_LOGE(TAG, "RTS: Popped ODD return address 0x%08X from stack at SP=0x%08X",
-                             return_addr, cpu->a[7]);
-                    ESP_LOGE(TAG, "Current PC was: 0x%08X", cpu->pc);
+                             return_addr, cpu->a[7] - 4);
+                    // Don't set PC to odd value - raise address error with current PC intact
+                    raise_group0_exception(VEC_ADDRESS_ERROR, return_addr, true);
+                } else {
+                    cpu->pc = return_addr;
                 }
-                cpu->pc = return_addr;
-                cpu->a[7] += 4;
                 cpu->cycles += 16;
             } else if (opcode == 0x4E76) {  // TRAPV
                 if (test_flag(SR_V)) {
@@ -2645,13 +3146,15 @@ static bool execute_instruction(void) {
                 cpu->sr = (cpu->sr & 0xFF00) | (read_word(cpu->a[7]) & 0xFF);
                 cpu->a[7] += 2;
                 uint32_t return_addr = read_long(cpu->a[7]);
+                cpu->a[7] += 4;
                 if (return_addr & 1) {
                     ESP_LOGE(TAG, "RTR: Popped ODD return address 0x%08X from stack at SP=0x%08X",
-                             return_addr, cpu->a[7]);
-                    ESP_LOGE(TAG, "Current PC was: 0x%08X", cpu->pc);
+                             return_addr, cpu->a[7] - 4);
+                    // Don't set PC to odd value - raise address error with current PC intact
+                    raise_group0_exception(VEC_ADDRESS_ERROR, return_addr, true);
+                } else {
+                    cpu->pc = return_addr;
                 }
-                cpu->pc = return_addr;
-                cpu->a[7] += 4;
                 cpu->cycles += 20;
             } else if ((opcode & 0xFFF0) == 0x4E40) {  // TRAP
                 exec_trap(opcode);
@@ -2682,8 +3185,14 @@ static bool execute_instruction(void) {
             } else if ((opcode & 0xF1C0) == 0x4180) {  // CHK
                 exec_chk(opcode);
             } else {
-                ESP_LOGW(TAG, "Unknown opcode 0x%04X at PC=0x%08X", opcode, cpu->pc - 2);
-                cpu->cycles += 4;
+                // Unrecognized opcode - raise ILLEGAL INSTRUCTION exception
+                // (just like a real 68000 does). This is critical because silently
+                // skipping would leave operand words in the instruction stream,
+                // causing cascading mis-decoding and memory corruption.
+                ESP_LOGW(TAG, "ILLEGAL opcode 0x%04X at PC=0x%08X", opcode, cpu->pc - 2);
+                cpu->pc -= 2;  // Point PC back to the illegal instruction
+                raise_exception(VEC_ILLEGAL);
+                cpu->cycles += 34;
             }
             break;
             
@@ -2722,7 +3231,7 @@ static bool execute_instruction(void) {
 
                     if (opcode & 0x0100) {  // SUBQ
                         result = (ea_val - data) & mask;
-                        set_ea_value(mode, reg, size, result);
+                        set_ea_value_writeback(mode, reg, size, result);
                         set_flags_nz(result, size);
                         if (data > ea_val) set_flag(SR_C | SR_X);
                         else clear_flag(SR_C | SR_X);
@@ -2732,7 +3241,7 @@ static bool execute_instruction(void) {
                         else clear_flag(SR_V);
                     } else {  // ADDQ
                         result = (ea_val + data) & mask;
-                        set_ea_value(mode, reg, size, result);
+                        set_ea_value_writeback(mode, reg, size, result);
                         set_flags_nz(result, size);
                         if ((uint64_t)ea_val + data > mask) set_flag(SR_C | SR_X);
                         else clear_flag(SR_C | SR_X);
@@ -2974,8 +3483,10 @@ static bool execute_instruction(void) {
                 if (opcode & 0x0100) exec_rol(opcode);
                 else exec_ror(opcode);
             } else {
-                ESP_LOGD(TAG, "Shift/rotate: 0x%04X", opcode);
-                cpu->cycles += 6;
+                ESP_LOGW(TAG, "ILLEGAL shift/rotate opcode 0x%04X at PC=0x%08X", opcode, cpu->pc - 2);
+                cpu->pc -= 2;
+                raise_exception(VEC_ILLEGAL);
+                cpu->cycles += 34;
             }
             break;
             
@@ -3075,19 +3586,23 @@ esp_err_t m68k_init(void) {
 
 void m68k_reset(void) {
     if (cpu == NULL) return;
-    
+
     // Reset watchdog and timeout tracking
     recovery_state.start_time = 0;
     recovery_state.watchdog_cycles = 0;
     recovery_state.watchdog_pc = 0;
+    recovery_state.watchdog_pc_min = 0;
+    recovery_state.watchdog_pc_max = 0;
     recovery_state.recovery_count = 0;
+    recovery_state.stop_cycles = 0;
+    in_group0 = false;
     
     // Read reset vectors from memory
     uint32_t ssp_raw = read_long(0x000000);
     uint32_t pc_raw = read_long(0x000004);
     
-    cpu->ssp = ssp_raw;
-    cpu->pc = pc_raw & M68K_ADDRESS_MASK;  // Apply 24-bit mask to PC
+    cpu->ssp = ssp_raw & M68K_ADDRESS_MASK;  // 68000: 24-bit address bus
+    cpu->pc = pc_raw & M68K_ADDRESS_MASK;   // Apply 24-bit mask to PC
     cpu->a[7] = cpu->ssp;
     cpu->sr = SR_S | 0x0700;
     cpu->running = true;
@@ -3115,9 +3630,14 @@ void m68k_load_program(const uint8_t *data, uint32_t size, uint32_t addr) {
 
 void m68k_run(uint32_t instructions) {
     if (cpu == NULL || !cpu->running) return;
-    
+
+    int64_t start_us = esp_timer_get_time();
     for (uint32_t i = 0; i < instructions && !cpu->halted; i++) {
         execute_instruction();
+        // Yield guarantee: break if >5ms elapsed (every 128 instructions check)
+        if ((i & 0x7F) == 0x7F) {
+            if ((esp_timer_get_time() - start_us) > 5000) break;
+        }
     }
 }
 
@@ -3384,11 +3904,12 @@ void m68k_set_exception_recovery(bool enable) {
 
 bool m68k_recover_from_crash(void) {
     if (!cpu) return false;
-    
+
     ESP_LOGI(TAG, "Manual crash recovery requested");
-    
-    // Reset crash context
+
+    // Reset crash context and exception state
     crash_ctx.valid = false;
+    in_group0 = false;
     
     // Try to recover
     if (try_exception_recovery(0)) {

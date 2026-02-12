@@ -234,6 +234,14 @@ void i86_cpu_write_byte(uint32_t addr, uint8_t value);
 void i86_cpu_write_word(uint32_t addr, uint16_t value);
 
 /**
+ * Set/get individual CPU flags
+ * @param flag_idx Flag index (FLAG_IDX_CF, FLAG_IDX_ZF, etc.)
+ * @param value Flag value (0 or 1)
+ */
+void i86_cpu_set_flag(int flag_idx, uint8_t value);
+uint8_t i86_cpu_get_flag(int flag_idx);
+
+/**
  * Get memory pointer for direct access
  */
 uint8_t *i86_cpu_get_memory(void);

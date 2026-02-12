@@ -518,7 +518,7 @@ static void process_packet(const bt_packet_t *packet)
         case BT_EVT_CONNECTED:
         case BT_EVT_DISCONNECTED: {
             if (packet->length >= 6) {
-                uint8_t *address = packet->payload;
+                const uint8_t *address = packet->payload;
                 bool connected = (packet->cmd == BT_EVT_CONNECTED);
                 
                 xSemaphoreTake(bt_state->mutex, portMAX_DELAY);

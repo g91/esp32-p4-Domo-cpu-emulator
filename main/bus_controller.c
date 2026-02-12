@@ -5,9 +5,11 @@
 
 #include "bus_controller.h"
 #include "m68k_emulator.h"
+#include "video_card.h"
 #include "wifi_ftp_server.h"
 #include "lcd_console.h"
 #include "ps2_keyboard.h"
+#include "usb_keyboard.h"
 #include <string.h>
 #include <math.h>
 #include <sys/socket.h>
@@ -18,6 +20,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -40,6 +43,24 @@ static SemaphoreHandle_t dma_mutex = NULL;
 // Current application
 static application_t current_app;
 static SemaphoreHandle_t app_mutex = NULL;
+
+// UART input buffer for console
+#define UART_INPUT_BUFFER_SIZE 256
+static struct {
+    uint8_t buffer[UART_INPUT_BUFFER_SIZE];
+    volatile int head;
+    volatile int tail;
+    SemaphoreHandle_t mutex;
+} uart_input;
+
+// Console output buffer for batched LCD updates
+#define CONSOLE_OUT_BUFFER_SIZE 128
+static struct {
+    char buffer[CONSOLE_OUT_BUFFER_SIZE];
+    volatile int count;
+    uint64_t last_flush_time;
+    SemaphoreHandle_t mutex;
+} console_out_buffer;
 
 // Network device state
 static struct {
@@ -331,6 +352,100 @@ static struct {
     bool initialized;
 } video_device;
 
+// ============================================================================
+// UART Input Buffer Functions
+// ============================================================================
+
+// Check if UART input is available
+static inline bool uart_input_available(void) {
+    return uart_input.head != uart_input.tail;
+}
+
+// Read a character from UART input buffer (non-blocking)
+static inline uint8_t uart_input_read(void) {
+    if (!uart_input_available()) {
+        return 0;
+    }
+    
+    uint8_t c = uart_input.buffer[uart_input.tail];
+    uart_input.tail = (uart_input.tail + 1) % UART_INPUT_BUFFER_SIZE;
+    return c;
+}
+
+// Write a character to UART input buffer (from UART task)
+static inline void uart_input_write(uint8_t c) {
+    int next_head = (uart_input.head + 1) % UART_INPUT_BUFFER_SIZE;
+    if (next_head != uart_input.tail) {
+        uart_input.buffer[uart_input.head] = c;
+        uart_input.head = next_head;
+    }
+}
+
+// UART input task - reads from stdin and buffers characters
+static void uart_input_task(void *arg) {
+    ESP_LOGI(TAG, "UART input task started");
+    
+    while (1) {
+        // Check for input from UART (non-blocking)
+        int c = fgetc(stdin);
+        if (c != EOF) {
+            // Take mutex to safely add to buffer
+            if (uart_input.mutex != NULL) {
+                xSemaphoreTake(uart_input.mutex, portMAX_DELAY);
+                uart_input_write((uint8_t)c);
+                xSemaphoreGive(uart_input.mutex);
+            }
+        }
+        // Small delay to avoid hogging CPU
+        vTaskDelay(pdMS_TO_TICKS(10));  // Check every 10ms
+    }
+}
+
+// Flush console output buffer to LCD (or video card framebuffer)
+static void console_output_flush(void) {
+    if (console_out_buffer.count > 0) {
+        console_out_buffer.buffer[console_out_buffer.count] = '\0';
+        
+        if (video_card_is_initialized()) {
+            // Route through video card framebuffer - no LCD conflict
+            video_card_print(console_out_buffer.buffer);
+        } else if (lcd_console_is_initialized()) {
+            // Fallback: direct LCD text console
+            lcd_console_print(console_out_buffer.buffer);
+        }
+        
+        console_out_buffer.count = 0;
+        console_out_buffer.last_flush_time = esp_timer_get_time();
+    }
+}
+
+// Add character to console output buffer
+static void console_output_putchar(char ch) {
+    if (console_out_buffer.mutex == NULL) return;
+    
+    xSemaphoreTake(console_out_buffer.mutex, portMAX_DELAY);
+    
+    // Add to buffer
+    if (console_out_buffer.count < CONSOLE_OUT_BUFFER_SIZE - 1) {
+        console_out_buffer.buffer[console_out_buffer.count++] = ch;
+    }
+    
+    // Flush if buffer is full or newline or 5ms timeout
+    uint64_t now = esp_timer_get_time();
+    bool buffer_full = (console_out_buffer.count >= CONSOLE_OUT_BUFFER_SIZE - 1);
+    bool is_newline = (ch == '\n');
+    bool timeout = ((now - console_out_buffer.last_flush_time) > 5000); // 5ms
+    
+    if (buffer_full || is_newline || timeout) {
+        console_output_flush();
+    }
+    
+    xSemaphoreGive(console_out_buffer.mutex);
+}
+
+// ============================================================================
+
+
 // Default VGA 16-color palette
 static const uint32_t default_palette_16[16] = {
     0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
@@ -503,6 +618,26 @@ esp_err_t bus_controller_init(void)
     video_device.fg_color = 0xFFFFFF;
     video_device.bg_color = 0x000000;
     
+    // Initialize UART input buffer
+    memset(&uart_input, 0, sizeof(uart_input));
+    uart_input.head = 0;
+    uart_input.tail = 0;
+    uart_input.mutex = xSemaphoreCreateMutex();
+    if (!uart_input.mutex) {
+        ESP_LOGE(TAG, "Failed to create UART input mutex");
+        return ESP_FAIL;
+    }
+    
+    // Initialize console output buffer
+    memset(&console_out_buffer, 0, sizeof(console_out_buffer));
+    console_out_buffer.count = 0;
+    console_out_buffer.last_flush_time = esp_timer_get_time();
+    console_out_buffer.mutex = xSemaphoreCreateMutex();
+    if (!console_out_buffer.mutex) {
+        ESP_LOGE(TAG, "Failed to create console output mutex");
+        return ESP_FAIL;
+    }
+    
     // Create mutexes
     socket_mutex = xSemaphoreCreateMutex();
     dma_mutex = xSemaphoreCreateMutex();
@@ -510,6 +645,20 @@ esp_err_t bus_controller_init(void)
     
     if (!socket_mutex || !dma_mutex || !app_mutex) {
         ESP_LOGE(TAG, "Failed to create mutexes");
+        return ESP_FAIL;
+    }
+    
+    // Start UART input task
+    BaseType_t task_ret = xTaskCreate(
+        uart_input_task,
+        "uart_input",
+        4096,               // Stack size
+        NULL,               // Parameters
+        5,                  // Priority (same as other I/O tasks)
+        NULL                // Handle
+    );
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create UART input task");
         return ESP_FAIL;
     }
     
@@ -561,19 +710,31 @@ uint32_t bus_io_read(uint32_t address, uint8_t size)
     // Console device (0x00F02000)
     if (device == BUS_DEV_CONSOLE) {
         if (reg == 0x04) {  // Console input register
-            // Read character from PS/2 keyboard or stdin
+            // Read character from PS/2 keyboard first, then USB keyboard, then UART buffer
             if (ps2_keyboard_available()) {
                 return ps2_keyboard_read();
             }
-            int ch = fgetc(stdin);
-            return (ch == EOF) ? 0 : (uint8_t)ch;
+            // Check USB keyboard
+            if (usb_keyboard_is_initialized() && usb_keyboard_available()) {
+                return usb_keyboard_read();
+            }
+            // Read from UART input buffer
+            if (uart_input.mutex != NULL) {
+                xSemaphoreTake(uart_input.mutex, portMAX_DELAY);
+                uint8_t ch = uart_input_read();
+                xSemaphoreGive(uart_input.mutex);
+                return ch;
+            }
+            return 0;
         }
         else if (reg == 0x08) {  // Console status register
             // Bit 0: RX ready (character available)
             // Bit 1: TX ready (always ready)
             uint8_t status = 0x02;  // TX always ready
-            if (ps2_keyboard_available()) {
-                status |= 0x01;  // RX ready if keyboard has data
+            if (ps2_keyboard_available() || 
+                (usb_keyboard_is_initialized() && usb_keyboard_available()) ||
+                uart_input_available()) {
+                status |= 0x01;  // RX ready if keyboard or UART has data
             }
             return status;
         }
@@ -680,9 +841,12 @@ uint32_t bus_io_read(uint32_t address, uint8_t size)
         return 0;
     }
     
-    // Video device reads
+    // Video device reads - dispatch to video card module
     if (device == BUS_DEV_VIDEO) {
-        // Palette reads
+        if (video_card_is_initialized()) {
+            return video_card_read(reg, size);
+        }
+        // Fallback: legacy video_device struct for backwards compatibility
         if (reg >= VID_PALETTE_OFFSET && reg < VID_PALETTE_OFFSET + VID_PALETTE_SIZE * 4) {
             uint32_t idx = (reg - VID_PALETTE_OFFSET) / 4;
             return video_device.palette[idx];
@@ -882,9 +1046,9 @@ void bus_io_write(uint32_t address, uint32_t data, uint8_t size)
                 write_count++;
             }
             
-            if (lcd_console_is_initialized()) {
-                lcd_console_putchar(ch);
-            }
+            // Use buffered output to batch LCD updates
+            console_output_putchar(ch);
+            
             // Also echo to UART for debugging
             putchar(ch);
             fflush(stdout);
@@ -1032,7 +1196,11 @@ void bus_io_write(uint32_t address, uint32_t data, uint8_t size)
     
     // Video device writes
     if (device == BUS_DEV_VIDEO) {
-        // Palette writes
+        if (video_card_is_initialized()) {
+            video_card_write(reg, data, size);
+            return;
+        }
+        // Fallback: legacy video_device struct for backwards compatibility
         if (reg >= VID_PALETTE_OFFSET && reg < VID_PALETTE_OFFSET + VID_PALETTE_SIZE * 4) {
             uint32_t idx = (reg - VID_PALETTE_OFFSET) / 4;
             video_device.palette[idx] = data;

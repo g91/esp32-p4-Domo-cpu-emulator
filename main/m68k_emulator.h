@@ -85,10 +85,35 @@ bool m68k_recover_from_crash(void);
 // Set execution timeout (0 = unlimited)
 void m68k_set_timeout(uint32_t milliseconds);
 
+// I/O hooks for peripheral emulation (Atari ST, etc.)
+// read_hook: returns value, sets *handled=true if it handled the access
+// write_hook: writes value, sets *handled=true if it handled the access
+typedef uint32_t (*m68k_io_read_hook_t)(uint32_t addr, int size, bool *handled);
+typedef void (*m68k_io_write_hook_t)(uint32_t addr, uint32_t value, int size, bool *handled);
+void m68k_set_io_hooks(m68k_io_read_hook_t read_hook, m68k_io_write_hook_t write_hook);
+
+// External interrupt (IRQ) support
+// Set the interrupt priority level (0-7, 0=none, 7=NMI)
+void m68k_set_irq(uint8_t level);
+
+// IRQ acknowledge callback - called when CPU acknowledges interrupt at given level
+// Should return the vector number (0-255), or 0 for autovector
+// If no callback set, all interrupts are autovectored
+typedef uint8_t (*m68k_irq_ack_hook_t)(uint8_t level);
+void m68k_set_irq_ack_hook(m68k_irq_ack_hook_t hook);
+
 // Memory garbage collection
 void m68k_gc_mark_region(uint32_t start, uint32_t end);
 void m68k_gc_collect(void);
 void m68k_gc_stats(uint32_t *used, uint32_t *free, uint32_t *regions);
+
+// Get CPU cycle counter (for accurate timing by emulated hardware)
+uint64_t m68k_get_cycles(void);
+
+// RESET instruction callback - called when M68K executes RESET opcode
+// This resets external hardware only (CIAs, custom chips), NOT the CPU
+typedef void (*m68k_reset_hook_t)(void);
+void m68k_set_reset_hook(m68k_reset_hook_t hook);
 
 // Watchdog control
 void m68k_watchdog_reset(void);

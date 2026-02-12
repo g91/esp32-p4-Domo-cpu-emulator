@@ -236,14 +236,14 @@ static const uint8_t optcodes[] = {
     0,  0,  0,  0,  0,  0,  1,  0,  0,  0,  0,  0,  0,  0,  1,  0, // 30-3f
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // 40-4f
     9,  9,  9,  9,  9,  9,  9,  9,  8,  8,  8,  8,  8,  8,  8,  8, // 50-5f
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // 60-6f
+    0,  0,  0,  0,  1,  1,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // 60-6f (0x64=FS, 0x65=GS)
     2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2, // 70-7f
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 18,  0, // 80-8f
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // 90-9f
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // a0-af
    10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, // b0-bf
     0,  0,  0,  7,  0,  0,  0,  0,  0,  0,  0, 17,  0, 15,  0, 16, // c0-cf
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // d0-df
+    0,  0,  0,  0,  0,  0,  0,  0, 61, 61, 61, 61, 61, 61, 61, 61, // d0-df (0xD8-0xDF = 8087 ESC)
     0,  0,  0,  5,  0,  0,  0,  0,  6,  0,  0,  3,  0,  0,  0,  0, // e0-ef
     0,  0, 14, 14,  0,  0,  0,  0,  4,  4,  4,  4,  4,  4,  0,  0, // f0-ff
 };
@@ -265,6 +265,13 @@ static int32_t  op_to_addr, op_from_addr;
 #define FLAGS   g_cpu.flags
 #define REG_IP  g_cpu.ip
 
+// Register base address in the RMEM/WMEM address space.
+// Must be above the max possible 8086 physical address (0x10FFEF from
+// segment 0xFFFF, offset 0xFFFF) so that register-indirect operations
+// via step_ex() (which use regs_offset + N) don't collide with any
+// real memory address including the IVT at physical address 0.
+#define REGS_BASE 0x110000
+
 // Flag access macros (note: FLAG_xx indices defined in header as FLAG_IDX_xx)
 #define F_CF (FLAGS[CF_ADDR])
 #define F_PF (FLAGS[PF_ADDR])
@@ -276,8 +283,14 @@ static int32_t  op_to_addr, op_from_addr;
 #define F_DF (FLAGS[DF_ADDR])
 #define F_OF (FLAGS[OF_ADDR])
 
-// Memory read with video callback
+// Memory read with register and video callback support
+// When addr is in the register range (REGS_BASE..REGS_BASE+31),
+// redirect to the CPU register array instead of physical memory.
 static uint8_t RMEM8(int addr) {
+    unsigned reg_off = (unsigned)(addr - REGS_BASE);
+    if (reg_off < 32u) {
+        return ((uint8_t*)g_cpu.regs16)[reg_off];
+    }
     if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.read_video8) {
         return g_cpu.read_video8(g_cpu.callback_ctx, addr);
     }
@@ -285,15 +298,22 @@ static uint8_t RMEM8(int addr) {
 }
 
 static uint16_t RMEM16(int addr) {
+    unsigned reg_off = (unsigned)(addr - REGS_BASE);
+    if (reg_off < 32u) {
+        return *(uint16_t*)((uint8_t*)g_cpu.regs16 + reg_off);
+    }
     if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.read_video16) {
         return g_cpu.read_video16(g_cpu.callback_ctx, addr);
     }
     return *(uint16_t*)(g_cpu.memory + addr);
 }
 
-// Memory write with video callback
+// Memory write with register and video callback support
 static inline uint8_t WMEM8(int addr, uint8_t value) {
-    if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video8) {
+    unsigned reg_off = (unsigned)(addr - REGS_BASE);
+    if (reg_off < 32u) {
+        ((uint8_t*)g_cpu.regs16)[reg_off] = value;
+    } else if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video8) {
         g_cpu.write_video8(g_cpu.callback_ctx, addr, value);
     } else {
         g_cpu.memory[addr] = value;
@@ -302,7 +322,10 @@ static inline uint8_t WMEM8(int addr, uint8_t value) {
 }
 
 static inline uint16_t WMEM16(int addr, uint16_t value) {
-    if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video16) {
+    unsigned reg_off = (unsigned)(addr - REGS_BASE);
+    if (reg_off < 32u) {
+        *(uint16_t*)((uint8_t*)g_cpu.regs16 + reg_off) = value;
+    } else if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video16) {
         g_cpu.write_video16(g_cpu.callback_ctx, addr, value);
     } else {
         *(uint16_t*)(g_cpu.memory + addr) = value;
@@ -450,8 +473,9 @@ int i86_cpu_init(void) {
     g_cpu.video = g_cpu.memory + VIDEOMEM_START;
     g_cpu.bios = g_cpu.memory + BIOSMEM_START;
     
-    // Calculate register offset
-    g_cpu.regs_offset = 0; // Registers are in struct, not memory
+    // Register offset: point to REGS_BASE so that RMEM/WMEM redirect
+    // register-indirect accesses (regs_offset + N) to the register array
+    g_cpu.regs_offset = REGS_BASE;
     
     g_cpu.initialized = true;
     
@@ -528,10 +552,15 @@ void i86_cpu_step(void) {
         // Quick processing for common instructions
         switch (optcodes[*opcode_stream]) {
             
-            // SEG ES/CS/SS/DS (0x26, 0x2e, 0x36, 0x3e)
+            // SEG ES/CS/SS/DS (0x26, 0x2e, 0x36, 0x3e) + FS/GS (0x64, 0x65)
             case 1:
                 seg_override_en = 2;
-                seg_override = ex_data[*opcode_stream];
+                // 386 segment overrides FS/GS don't exist on 8086, map to DS
+                if (*opcode_stream == 0x64 || *opcode_stream == 0x65) {
+                    seg_override = REG_DS;
+                } else {
+                    seg_override = ex_data[*opcode_stream];
+                }
                 if (rep_override_en) ++rep_override_en;
                 ++REG_IP;
                 return;
@@ -672,6 +701,33 @@ void i86_cpu_step(void) {
                 step_ex(opcode_stream);
                 g_cpu.instructions++;
                 break; // Reloop to inhibit interrupt
+            
+            // 8087 FPU ESC instructions (0xD8-0xDF)
+            case 61: {
+                // FPU instructions have ModR/M byte that determines operand
+                uint8_t modrm = opcode_stream[1];
+                uint8_t mod = (modrm >> 6) & 3;
+                uint8_t rm = modrm & 7;
+                
+                // Decode instruction length based on ModR/M addressing mode
+                int inst_len = 2; // ESC opcode + ModR/M byte
+                
+                if (mod == 0) {
+                    // Memory operand with no displacement
+                    if (rm == 6) inst_len += 2; // Direct address exception
+                } else if (mod == 1) {
+                    // Memory operand with 8-bit displacement
+                    inst_len += 1;
+                } else if (mod == 2) {
+                    // Memory operand with 16-bit displacement
+                    inst_len += 2;
+                }
+                // mod == 3 means register operand, no extra bytes
+                
+                REG_IP += inst_len;
+                g_cpu.instructions++;
+                return;
+            }
             
             default:
                 step_ex(opcode_stream);
@@ -1545,20 +1601,75 @@ static void step_ex(const uint8_t *opcode_stream) {
             MEM16(16 * REGS16[REG_SS] + REGS16[REG_SP]) = (i_data0 & 0xff) | (i_data0 & 0x80 ? 0xff00 : 0);
             break;
             
-        case 58: // 80186: IMUL
-            ESP_LOGW(TAG, "80186 IMUL - not implemented");
+        case 58: // 80186: IMUL r16, r/m16, imm16/imm8
+            // IMUL with immediate: reg = r/m * imm
+            // Opcodes: 0x69 (imm16), 0x6B (imm8 sign-extended)
+            set_flags_type = 1;
+            raw_opcode_id = 0x10;
+            if (i_w) {
+                // 16-bit multiply
+                int32_t result = (int16_t)RMEM16(rm_addr) * (int16_t)i_data0;
+                REGS16[i_reg] = (uint16_t)result;
+                op_result = result;
+                // Set CF/OF if result doesn't fit in 16 bits
+                F_OF = F_CF = (result != (int16_t)result);
+            } else {
+                // 8-bit multiply (shouldn't happen with 0x69/0x6B, but handle it)
+                int16_t result = (int8_t)RMEM8(rm_addr) * (int8_t)(i_data0 & 0xFF);
+                REGS8[i_reg] = (uint8_t)result;
+                op_result = result;
+                F_OF = F_CF = (result != (int8_t)result);
+            }
             break;
             
-        case 59: // 80186: INSB/INSW
-            ESP_LOGW(TAG, "INSB/INSW - not implemented");
+        case 59: // 80186: INSB/INSW (opcodes 0x6C/0x6D)
+            // INS - Input string from port DX to ES:[DI]
+            // INSB: ES:[DI] = IN(DX), DI += 1 (or -1 if DF=1)
+            // INSW: ES:[DI+1:DI] = IN(DX), DI += 2 (or -2 if DF=1)
+            if (i_w) {
+                // INSW - read 16-bit word from port
+                uint16_t port = REGS16[REG_DX];
+                uint32_t addr = 16 * REGS16[REG_ES] + REGS16[REG_DI];
+                if (g_cpu.read_port) {
+                    MEM8(addr) = g_cpu.read_port(g_cpu.callback_ctx, port);
+                    MEM8(addr + 1) = g_cpu.read_port(g_cpu.callback_ctx, port + 1);
+                }
+                REGS16[REG_DI] += F_DF ? -2 : 2;
+            } else {
+                // INSB - read 8-bit byte from port
+                uint16_t port = REGS16[REG_DX];
+                uint32_t addr = 16 * REGS16[REG_ES] + REGS16[REG_DI];
+                if (g_cpu.read_port) {
+                    MEM8(addr) = g_cpu.read_port(g_cpu.callback_ctx, port);
+                }
+                REGS16[REG_DI] += F_DF ? -1 : 1;
+            }
             break;
             
-        case 60: // 80186: OUTSB/OUTSW
-            ESP_LOGW(TAG, "OUTSB/OUTSW - not implemented");
-            break;
-            
-        case 69: // 8087 Math Coprocessor
-            ESP_LOGW(TAG, "8087 coprocessor %02X %02X - not implemented", opcode_stream[0], opcode_stream[1]);
+        case 60: // 80186: OUTSB/OUTSW (opcodes 0x6E/0x6F)
+            // OUTS - Output string from DS:[SI] to port DX
+            // OUTSB: OUT(DX) = DS:[SI], SI += 1 (or -1 if DF=1)
+            // OUTSW: OUT(DX) = DS:[SI+1:SI], SI += 2 (or -2 if DF=1)
+            if (i_w) {
+                // OUTSW - write 16-bit word to port
+                uint16_t port = REGS16[REG_DX];
+                uint16_t seg = seg_override_en ? seg_override : REG_DS;
+                uint32_t addr = 16 * REGS16[seg] + REGS16[REG_SI];
+                if (g_cpu.write_port) {
+                    g_cpu.write_port(g_cpu.callback_ctx, port, MEM8(addr));
+                    g_cpu.write_port(g_cpu.callback_ctx, port + 1, MEM8(addr + 1));
+                }
+                REGS16[REG_SI] += F_DF ? -2 : 2;
+            } else {
+                // OUTSB - write 8-bit byte to port
+                uint16_t port = REGS16[REG_DX];
+                uint16_t seg = seg_override_en ? seg_override : REG_DS;
+                uint32_t addr = 16 * REGS16[seg] + REGS16[REG_SI];
+                if (g_cpu.write_port) {
+                    g_cpu.write_port(g_cpu.callback_ctx, port, MEM8(addr));
+                }
+                REGS16[REG_SI] += F_DF ? -1 : 1;
+            }
             break;
             
         default:
@@ -1608,6 +1719,9 @@ bool i86_cpu_irq(uint8_t irq_num) {
     if (!g_cpu.pending_irq) {
         g_cpu.pending_irq = true;
         g_cpu.pending_irq_num = irq_num;
+        if (g_cpu.halted) {
+            g_cpu.halted = false;  // Wake CPU from HLT on interrupt
+        }
         return true;
     }
     return false;
@@ -1680,6 +1794,19 @@ uint8_t *i86_cpu_get_memory(void) { return g_cpu.memory; }
 uint8_t *i86_cpu_get_ram(void) { return g_cpu.ram; }
 uint8_t *i86_cpu_get_video(void) { return g_cpu.video; }
 uint8_t *i86_cpu_get_bios(void) { return g_cpu.bios; }
+
+void i86_cpu_set_flag(int flag_idx, uint8_t value) {
+    if (flag_idx >= 0 && flag_idx < 9) {
+        g_cpu.flags[flag_idx] = value ? 1 : 0;
+    }
+}
+
+uint8_t i86_cpu_get_flag(int flag_idx) {
+    if (flag_idx >= 0 && flag_idx < 9) {
+        return g_cpu.flags[flag_idx];
+    }
+    return 0;
+}
 
 int i86_cpu_load_bios(const uint8_t *data, size_t size) {
     if (!g_cpu.initialized || !data || size == 0) {

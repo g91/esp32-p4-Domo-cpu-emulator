@@ -5,6 +5,7 @@
  */
 
 #include "usb_keyboard.h"
+#include "usb_mouse.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -21,6 +22,7 @@ static const char *TAG = "USB_KBD";
 static bool initialized = false;
 static QueueHandle_t key_queue = NULL;
 static hid_host_device_handle_t kbd_handle = NULL;
+static hid_host_device_handle_t mouse_handle = NULL;
 
 // USB HID keycodes to ASCII translation table
 static const uint8_t hid_to_ascii[] = {
@@ -59,6 +61,12 @@ static void hid_host_interface_callback(hid_host_device_handle_t hid_device_hand
         ESP_ERROR_CHECK(hid_host_device_get_raw_input_report_data(hid_device_handle,
                                                                   data, 64, &data_length));
         
+        // Check if this is a mouse report
+        if (hid_device_handle == mouse_handle) {
+            usb_mouse_process_report(data, data_length);
+            break;
+        }
+        
         if (data_length >= 8) {
             // HID keyboard report: Byte 0 = modifiers, Bytes 2-7 = keycodes
             uint8_t modifier = data[0];
@@ -86,6 +94,10 @@ static void hid_host_interface_callback(hid_host_device_handle_t hid_device_hand
         ESP_LOGI(TAG, "HID Device disconnected");
         if (hid_device_handle == kbd_handle) {
             kbd_handle = NULL;
+        }
+        if (hid_device_handle == mouse_handle) {
+            mouse_handle = NULL;
+            usb_mouse_set_connected(false);
         }
         break;
         
@@ -118,6 +130,8 @@ static void hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
             ESP_LOGI(TAG, "  Protocol: %d", dev_params.proto);
             ESP_LOGI(TAG, "  SubClass: %d", dev_params.sub_class);
             
+            bool is_mouse = (dev_params.proto == HID_PROTOCOL_MOUSE);
+            
             // Configure device with interface callback
             const hid_host_device_config_t dev_config = {
                 .callback = hid_host_interface_callback,
@@ -125,15 +139,24 @@ static void hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
             };
             
             // Open the device
-            ESP_LOGI(TAG, "Opening HID device...");
+            ESP_LOGI(TAG, "Opening HID device (%s)...", is_mouse ? "mouse" : "keyboard");
             if (hid_host_device_open(hid_device_handle, &dev_config) == ESP_OK) {
                 ESP_LOGI(TAG, "✓ USB HID device opened successfully");
-                kbd_handle = hid_device_handle;
+                
+                if (is_mouse) {
+                    mouse_handle = hid_device_handle;
+                } else {
+                    kbd_handle = hid_device_handle;
+                }
                 
                 // Start receiving reports
                 ESP_LOGI(TAG, "Starting HID device...");
                 if (hid_host_device_start(hid_device_handle) == ESP_OK) {
-                    ESP_LOGI(TAG, ">>> USB Keyboard ready for input! <<<");
+                    if (is_mouse) {
+                        usb_mouse_set_connected(true);
+                    } else {
+                        ESP_LOGI(TAG, ">>> USB Keyboard ready for input! <<<");
+                    }
                 } else {
                     ESP_LOGE(TAG, "Failed to start HID device");
                 }

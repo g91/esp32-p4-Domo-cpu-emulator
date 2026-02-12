@@ -30,9 +30,12 @@
 #include "nvs_flash.h"
 #include "m68k_emulator.h"
 #include "i8086_emulator.h"
+#include "mos6502_emulator.h"
+#include "video_card.h"
 #include "disk_image.h"
 #include "lcd_console.h"
 #include "ps2_keyboard.h"
+#include "usb_keyboard.h"
 // Bluetooth support via ESP32-C6 SDIO using NimBLE + ESP-Hosted
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
@@ -46,6 +49,8 @@
 #include "lwip/sys.h"
 #include "driver/usb_serial_jtag.h"
 #include "bus_controller.h"
+#include "atari_st.h"
+#include "amiga.h"
 #include "wifi_ftp_server.h"
 #include "ssh_debug_server.h"
 #include <ctype.h>
@@ -63,6 +68,16 @@ static bool bt_initialized = false;
 static bool bt_scanning = false;
 
 // i386 PC emulator (uses tiny386 engine via pc_emulator module)
+static TaskHandle_t s_i86_task_handle = NULL;
+static void i86_run_task(void *arg);
+
+// Atari ST emulator (uses M68K core + Atari ST hardware)
+static TaskHandle_t s_atari_task_handle = NULL;
+static void atari_st_run_task(void *arg);
+
+// Amiga emulator (uses M68K core + Amiga custom chips)
+static TaskHandle_t s_amiga_task_handle = NULL;
+static void amiga_run_task(void *arg);
 
 #define MAX_BLE_DEVICES 20
 typedef struct {
@@ -176,7 +191,8 @@ static bool lcd_console_active = false;
 // Active CPU selection
 typedef enum {
     ACTIVE_CPU_M68K,
-    ACTIVE_CPU_I8086
+    ACTIVE_CPU_I8086,
+    ACTIVE_CPU_6502
 } active_cpu_t;
 
 static active_cpu_t active_cpu = ACTIVE_CPU_M68K;
@@ -239,8 +255,9 @@ static char* resolve_path(const char *path) {
 
 /*
  * Dual-output printf - sends to both UART and LCD console
+ * Non-static: also used by i8086_emulator.c via console_printf()
  */
-static void dual_printf(const char *format, ...) {
+void dual_printf(const char *format, ...) {
     char buffer[512];
     va_list args;
     va_start(args, format);
@@ -250,14 +267,29 @@ static void dual_printf(const char *format, ...) {
     // Always print to UART
     printf("%s", buffer);
     
-    // Also print to LCD if active
-    if (lcd_console_active && lcd_console_is_initialized()) {
+    // Route to video card framebuffer if active (avoids LCD conflict)
+    if (video_card_is_initialized()) {
+        video_card_print(buffer);
+    } else if (lcd_console_active && lcd_console_is_initialized()) {
         lcd_console_print(buffer);
     }
 }
 
-// Macro to redirect printf to dual output
-#define console_printf dual_printf
+// Real exported function for other modules (i8086_emulator.c, etc.)
+int console_printf(const char *fmt, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    printf("%s", buffer);
+    if (video_card_is_initialized()) {
+        video_card_print(buffer);
+    } else if (lcd_console_active && lcd_console_is_initialized()) {
+        lcd_console_print(buffer);
+    }
+    return len;
+}
 
 // Boot splash screen with animation
 static void show_boot_splash(void) {
@@ -486,9 +518,12 @@ static void unmount_sd_card(void) {
 static void m68k_os_task(void *arg) {
     printf("M68K-OS task started\n");
     
-    // Clear LCD and show OS booting
-    if (lcd_console_is_initialized()) {
-        lcd_console_clear();
+    // Video card is already initialized and showing welcome text.
+    // Do NOT call lcd_console_clear() - that fights with the video card refresh task.
+    // If we need a clean screen, use the video card's text clear instead.
+    if (video_card_is_initialized()) {
+        video_card_text_clear();
+        video_card_print("M68K-OS Booting...\n\n");
     }
     
     // Run M68K continuously - it will handle console I/O through bus controller
@@ -510,6 +545,10 @@ static void m68k_os_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+// Forward declarations for boot menu
+static TaskHandle_t s_6502_task_handle = NULL;
+static void mos6502_run_task(void *arg);
+
 // Try to auto-boot OS.bin from SD card root
 // Returns true if OS was loaded and started, false otherwise
 static bool try_autoboot(void) {
@@ -521,68 +560,315 @@ static bool try_autoboot(void) {
     
     // Check if OS.bin exists
     struct stat st;
-    if (stat(os_path, &st) != 0) {
-        // OS.bin not found - not an error, just no auto-boot
+    bool os_exists = (stat(os_path, &st) == 0);
+    
+    // Check if any i8086 boot disk exists
+    bool i86_disk_found = false;
+    const char *i86_disk_paths[] = {
+        "/sdcard/freedos.img",
+        "/sdcard/boot.img",
+        "/sdcard/dos.img",
+        "/sdcard/floppy.img",
+        "/sdcard/hdd.img",
+        NULL
+    };
+    const char *i86_boot_disk = NULL;
+    for (int i = 0; i86_disk_paths[i] != NULL; i++) {
+        struct stat st2;
+        if (stat(i86_disk_paths[i], &st2) == 0) {
+            i86_disk_found = true;
+            i86_boot_disk = i86_disk_paths[i];
+            break;
+        }
+    }
+    
+    // Check for 6502 program
+    bool mos6502_prog_found = false;
+    struct stat st6502;
+    if (stat("/sdcard/6502.bin", &st6502) == 0) {
+        mos6502_prog_found = true;
+    }
+
+    // Check for C64 ROMs (need at least kernal.rom)
+    bool c64_roms_found = false;
+    struct stat st_c64;
+    if (stat("/sdcard/c64/kernal.rom", &st_c64) == 0) {
+        c64_roms_found = true;
+    }
+
+    // Check for VIC-20 ROMs (need at least kernal.rom)
+    bool vic20_roms_found = false;
+    struct stat st_vic20;
+    if (stat("/sdcard/vic20/kernal.rom", &st_vic20) == 0) {
+        vic20_roms_found = true;
+    }
+
+    // Check for Atari ST TOS ROM
+    bool atari_tos_found = false;
+    const char *atari_tos_path = NULL;
+    const char *atari_tos_paths[] = {
+        "/sdcard/atarist/tos.img",
+        "/sdcard/atarist/tos.rom",
+        "/sdcard/atarist/tos104.img",
+        "/sdcard/tos.img",
+        "/sdcard/tos.rom",
+        NULL
+    };
+    for (int i = 0; atari_tos_paths[i] != NULL; i++) {
+        struct stat st_tos;
+        if (stat(atari_tos_paths[i], &st_tos) == 0) {
+            atari_tos_found = true;
+            atari_tos_path = atari_tos_paths[i];
+            break;
+        }
+    }
+    // Check for Atari ST floppy disk
+    const char *atari_floppy_path = NULL;
+    const char *atari_floppy_paths[] = {
+        "/sdcard/atarist/disk.st",
+        "/sdcard/atarist/floppy.st",
+        "/sdcard/disk.st",
+        NULL
+    };
+    for (int i = 0; atari_floppy_paths[i] != NULL; i++) {
+        struct stat st_fl;
+        if (stat(atari_floppy_paths[i], &st_fl) == 0) {
+            atari_floppy_path = atari_floppy_paths[i];
+            break;
+        }
+    }
+
+    // Check for Amiga Kickstart ROM
+    bool amiga_kick_found = false;
+    const char *amiga_kick_path = NULL;
+    const char *amiga_kick_paths[] = {
+        "/sdcard/amiga/kick.rom",
+        "/sdcard/amiga/kick13.rom",
+        "/sdcard/amiga/kick20.rom",
+        "/sdcard/amiga/kick31.rom",
+        "/sdcard/kick.rom",
+        NULL
+    };
+    for (int i = 0; amiga_kick_paths[i] != NULL; i++) {
+        struct stat st_ak;
+        if (stat(amiga_kick_paths[i], &st_ak) == 0) {
+            amiga_kick_found = true;
+            amiga_kick_path = amiga_kick_paths[i];
+            break;
+        }
+    }
+    // Check for Amiga floppy disk (ADF)
+    const char *amiga_floppy_path = NULL;
+    const char *amiga_floppy_paths[] = {
+        "/sdcard/amiga/df0.adf",
+        "/sdcard/amiga/workbench.adf",
+        "/sdcard/amiga/boot.adf",
+        NULL
+    };
+    for (int i = 0; amiga_floppy_paths[i] != NULL; i++) {
+        struct stat st_af;
+        if (stat(amiga_floppy_paths[i], &st_af) == 0) {
+            amiga_floppy_path = amiga_floppy_paths[i];
+            break;
+        }
+    }
+    // Check for Amiga hard disk (HDF)
+    const char *amiga_hdf_path = NULL;
+    const char *amiga_hdf_paths[] = {
+        "/sdcard/amiga/hd0.hdf",
+        "/sdcard/amiga/hardfile.hdf",
+        NULL
+    };
+    for (int i = 0; amiga_hdf_paths[i] != NULL; i++) {
+        struct stat st_ah;
+        if (stat(amiga_hdf_paths[i], &st_ah) == 0) {
+            amiga_hdf_path = amiga_hdf_paths[i];
+            break;
+        }
+    }
+
+    // If nothing bootable exists, skip boot menu
+    if (!os_exists && !i86_disk_found && !mos6502_prog_found && !c64_roms_found && !vic20_roms_found && !atari_tos_found && !amiga_kick_found) {
         return false;
     }
     
     // Show boot menu
     printf("\n");
     printf("╔══════════════════════════════════════════════════╗\n");
-    printf("║              M68K BOOT MENU                      ║\n");
+    printf("║              SYSTEM BOOT MENU                    ║\n");
     printf("╚══════════════════════════════════════════════════╝\n");
     printf("\n");
-    printf("  [1] Boot M68K-OS (from OS.bin)\n");
+    if (os_exists) {
+        printf("  [1] Boot M68K-OS (Motorola 68000, from OS.bin)\n");
+    } else {
+        printf("  [1] (M68K-OS not found)\n");
+    }
     printf("  [2] Enter BIOS Shell\n");
+    if (i86_disk_found) {
+        printf("  [3] Boot IBM PC (Intel 8086, from %s)\n", i86_boot_disk);
+    } else {
+        printf("  [3] Boot IBM PC (mount disk first)\n");
+    }
+    if (mos6502_prog_found) {
+        printf("  [4] Boot MOS 6502 (from 6502.bin)\n");
+    } else {
+        printf("  [4] Boot MOS 6502 (bare, no program)\n");
+    }
+    if (c64_roms_found) {
+        printf("  [5] Boot Commodore 64 (C64 emulation)\n");
+    } else {
+        printf("  [5] Boot C64 (ROMs needed in /sdcard/c64/)\n");
+    }
+    if (vic20_roms_found) {
+        printf("  [6] Boot VIC-20 (VIC-20 emulation)\n");
+    } else {
+        printf("  [6] Boot VIC-20 (ROMs needed in /sdcard/vic20/)\n");
+    }
+    if (atari_tos_found) {
+        printf("  [7] Boot Atari ST (TOS from %s)\n", atari_tos_path);
+    } else {
+        printf("  [7] Boot Atari ST (TOS needed in /sdcard/atarist/)\n");
+    }
+    if (amiga_kick_found) {
+        printf("  [8] Boot Amiga (Kickstart from %s)\n", amiga_kick_path);
+    } else {
+        printf("  [8] Boot Amiga (ROM needed in /sdcard/amiga/)\n");
+    }
     printf("\n");
-    printf("Select option (1-2): ");
+    printf("Select option (1-8): ");
     
-    if (lcd_console_is_initialized()) {
+    // Show boot menu on display - use video card if active, otherwise lcd_console
+    if (video_card_is_initialized()) {
+        video_card_text_clear();
+        video_card_print("SYSTEM BOOT MENU\n");
+        video_card_print("================\n\n");
+        if (os_exists) video_card_print("[1] Boot M68K-OS\n");
+        video_card_print("[2] Enter BIOS\n");
+        if (i86_disk_found) video_card_print("[3] Boot IBM PC\n");
+        video_card_print("[4] MOS 6502\n");
+        if (c64_roms_found) video_card_print("[5] Commodore 64\n");
+        if (vic20_roms_found) video_card_print("[6] VIC-20\n");
+        if (atari_tos_found) video_card_print("[7] Atari ST\n");
+        if (amiga_kick_found) video_card_print("[8] Amiga\n");
+        video_card_print("\nSelect 1-8...\n");
+    } else if (lcd_console_is_initialized()) {
         lcd_console_clear();
-        lcd_console_print("M68K BOOT MENU\n");
-        lcd_console_print("==============\n\n");
-        lcd_console_print("[1] Boot M68K-OS\n");
-        lcd_console_print("[2] Enter BIOS\n\n");
-        lcd_console_print("Select 1 or 2...\n");
+        lcd_console_print("SYSTEM BOOT MENU\n");
+        lcd_console_print("================\n\n");
+        if (os_exists) {
+            lcd_console_print("[1] Boot M68K-OS\n");
+        }
+        lcd_console_print("[2] Enter BIOS\n");
+        if (i86_disk_found) {
+            lcd_console_print("[3] Boot IBM PC\n");
+        }
+        lcd_console_print("[4] MOS 6502\n");
+        if (c64_roms_found) {
+            lcd_console_print("[5] Commodore 64\n");
+        }
+        if (vic20_roms_found) {
+            lcd_console_print("[6] VIC-20\n");
+        }
+        if (atari_tos_found) {
+            lcd_console_print("[7] Atari ST\n");
+        }
+        if (amiga_kick_found) {
+            lcd_console_print("[8] Amiga\n");
+        }
+        lcd_console_print("\nSelect 1-8...\n");
     }
     
-    // Wait for user selection
+    // Wait for user selection with 5-second timeout (default to BIOS if no input)
     int selection = 0;
+    int timeout_count = 0;
     while (selection == 0) {
         // Check PS/2 keyboard input first (if initialized)
         if (ps2_keyboard_is_initialized()) {
             if (ps2_keyboard_available()) {
                 uint8_t key = ps2_keyboard_read();
-                if (key == '1') {
+                if (key == '1' && os_exists) {
                     selection = 1;
                     printf("1\n");
                 } else if (key == '2') {
                     selection = 2;
                     printf("2\n");
+                } else if (key == '3') {
+                    selection = 3;
+                    printf("3\n");
+                } else if (key == '4') {
+                    selection = 4;
+                    printf("4\n");
+                } else if (key == '5') {
+                    selection = 5;
+                    printf("5\n");
+                } else if (key == '6') {
+                    selection = 6;
+                    printf("6\n");
+                } else if (key == '7') {
+                    selection = 7;
+                    printf("7\n");
+                } else if (key == '8') {
+                    selection = 8;
+                    printf("8\n");
                 }
             }
         }
-        
+
+        // Check USB keyboard input (if initialized)
+        if (selection == 0 && usb_keyboard_is_initialized() && usb_keyboard_available()) {
+            uint8_t key = usb_keyboard_read();
+            if (key == '1' && os_exists) { selection = 1; printf("1\n"); }
+            else if (key == '2') { selection = 2; printf("2\n"); }
+            else if (key == '3') { selection = 3; printf("3\n"); }
+            else if (key == '4') { selection = 4; printf("4\n"); }
+            else if (key == '5') { selection = 5; printf("5\n"); }
+            else if (key == '6') { selection = 6; printf("6\n"); }
+            else if (key == '7') { selection = 7; printf("7\n"); }
+            else if (key == '8') { selection = 8; printf("8\n"); }
+        }
+
         // Check UART/USB Serial input (non-blocking)
         uint8_t uart_data;
         int len = uart_read_bytes(UART_NUM_0, &uart_data, 1, pdMS_TO_TICKS(10));
         if (len > 0) {
-            if (uart_data == '1') {
+            if (uart_data == '1' && os_exists) {
                 selection = 1;
                 printf("1\n");
             } else if (uart_data == '2') {
                 selection = 2;
                 printf("2\n");
+            } else if (uart_data == '3') {
+                selection = 3;
+                printf("3\n");
+            } else if (uart_data == '4') {
+                selection = 4;
+                printf("4\n");
+            } else if (uart_data == '5') {
+                selection = 5;
+                printf("5\n");
+            } else if (uart_data == '6') {
+                selection = 6;
+                printf("6\n");
+            } else if (uart_data == '7') {
+                selection = 7;
+                printf("7\n");
+            } else if (uart_data == '8') {
+                selection = 8;
+                printf("8\n");
             }
         }
         
         vTaskDelay(pdMS_TO_TICKS(50));
+        timeout_count++;
     }
     
     if (selection == 2) {
         // User chose BIOS
         printf("\nEntering BIOS...\n\n");
-        if (lcd_console_is_initialized()) {
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("Entering BIOS...\n");
+        } else if (lcd_console_is_initialized()) {
             lcd_console_clear();
             lcd_console_print("Entering BIOS...\n");
         }
@@ -590,12 +876,292 @@ static bool try_autoboot(void) {
         return false;
     }
     
-    // User chose to boot OS (selection == 1)
+    if (selection == 3) {
+        // User chose i8086 PC mode
+        printf("\nBooting IBM PC (i8086)...\n\n");
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("Booting IBM PC...\n\n");
+        } else if (lcd_console_is_initialized()) {
+            lcd_console_print("Booting IBM PC...\n\n");
+        }
+
+        // Initialize video card GPU for display output
+        if (!video_card_is_initialized()) {
+            video_card_init();
+        }
+
+        // Initialize i8086 emulator
+        i86_config_t i86_config = {
+            .ram_size = I86_RAM_SIZE,
+            .cpu_freq_mhz = 8,
+            .enable_fpu = false,
+            .enable_sound = false,
+            .boot_disk = i86_boot_disk,
+        };
+        esp_err_t i86_ret = i86_init(&i86_config);
+        if (i86_ret != ESP_OK) {
+            printf("Failed to init i8086: %s\n", esp_err_to_name(i86_ret));
+            return false;
+        }
+        
+        // If a boot disk was found, mount it
+        if (i86_boot_disk) {
+            disk_type_t type = disk_detect_type(i86_boot_disk);
+            int drive = (type == DISK_TYPE_HARD_DISK) ? 2 : 0;
+            i86_mount_disk(drive, i86_boot_disk);
+            printf("Mounted %s as drive %c:\n", i86_boot_disk,
+                   drive < 2 ? 'A' + drive : 'C' + (drive - 2));
+        }
+        
+        // Boot in a FreeRTOS task
+        BaseType_t task_ret = xTaskCreate(i86_run_task, "i8086_emu", 16384, NULL, 5, &s_i86_task_handle);
+        if (task_ret == pdPASS) {
+            printf("i8086 PC emulator running. UART available for monitoring.\n");
+            printf("Use 'stop86' to halt, or reset device.\n\n");
+            while (s_i86_task_handle != NULL) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            return false;  // Return to BIOS shell when emulator exits
+        } else {
+            printf("Failed to start i8086 task\n");
+            return false;
+        }
+    }
+    
+    // ---- MOS 6502 / C64 / VIC-20 boot handlers ----
+    if (selection >= 4 && selection <= 6) {
+        mos6502_machine_mode_t mode;
+        const char *mode_name;
+
+        switch (selection) {
+        case 4:
+            mode = MOS6502_MODE_BARE;
+            mode_name = "MOS 6502 (bare)";
+            break;
+        case 5:
+            mode = MOS6502_MODE_C64;
+            mode_name = "Commodore 64";
+            break;
+        case 6:
+        default:
+            mode = MOS6502_MODE_VIC20;
+            mode_name = "VIC-20";
+            break;
+        }
+
+        printf("\nBooting %s...\n\n", mode_name);
+        {
+            char lcd_msg[64];
+            snprintf(lcd_msg, sizeof(lcd_msg), "Booting %s...\n\n", mode_name);
+            if (video_card_is_initialized()) {
+                video_card_text_clear();
+                video_card_print(lcd_msg);
+            } else if (lcd_console_is_initialized()) {
+                lcd_console_clear();
+                lcd_console_print(lcd_msg);
+            }
+        }
+
+        // Initialize video card GPU (handles all display output)
+        if (!video_card_is_initialized()) {
+            esp_err_t vid_ret = video_card_init();
+            if (vid_ret != ESP_OK) {
+                printf("Warning: Video card init failed: %s\n", esp_err_to_name(vid_ret));
+            }
+        }
+
+        // Initialize emulator in the selected mode
+        esp_err_t ret = mos6502_emu_init_mode(mode);
+        if (ret != ESP_OK) {
+            printf("Failed to init 6502: %s\n", esp_err_to_name(ret));
+            return false;
+        }
+
+        // Load ROMs for C64/VIC-20 modes
+        if (mode != MOS6502_MODE_BARE) {
+            ret = mos6502_emu_load_roms();
+            if (ret != ESP_OK) {
+                printf("Warning: ROM loading had issues\n");
+            }
+        }
+
+        // For bare mode, try to load 6502.bin
+        if (mode == MOS6502_MODE_BARE && mos6502_prog_found) {
+            FILE *f = fopen("/sdcard/6502.bin", "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long fsize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                uint8_t *buf = malloc(fsize);
+                if (buf) {
+                    fread(buf, 1, fsize, f);
+                    mos6502_emu_load_program(buf, fsize, 0xE000);
+                    free(buf);
+                    printf("Loaded 6502.bin (%ld bytes at $E000)\n", fsize);
+                }
+                fclose(f);
+            }
+        }
+
+        // Reset CPU (reads vectors from $FFFC/$FFFD)
+        mos6502_emu_reset();
+
+        // Set active CPU
+        active_cpu = ACTIVE_CPU_6502;
+
+        // Start running in a FreeRTOS task
+        if (s_6502_task_handle == NULL) {
+            BaseType_t task_ret = xTaskCreate(mos6502_run_task, "6502_run", 8192, NULL, 5, &s_6502_task_handle);
+            if (task_ret == pdPASS) {
+                printf("%s running. Use 'stop6502' to halt.\n\n", mode_name);
+                while (s_6502_task_handle != NULL) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+                return false;  // Return to BIOS shell
+            } else {
+                printf("Failed to start 6502 task\n");
+            }
+        }
+        return false;
+    }
+
+    // ---- Atari ST boot handler ----
+    if (selection == 7) {
+        printf("\nBooting Atari ST...\n\n");
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("Booting Atari ST...\n\n");
+        } else if (lcd_console_is_initialized()) {
+            lcd_console_clear();
+            lcd_console_print("Booting Atari ST...\n\n");
+        }
+
+        atari_st_config_t atari_config = {
+            .ram_size = ATARI_RAM_SIZE,
+            .tos_path = atari_tos_path,
+            .floppy_a_path = atari_floppy_path,
+            .floppy_b_path = NULL,
+            .cart_path = NULL,
+            .enable_lcd_output = true,
+        };
+
+        esp_err_t atari_ret = atari_st_init(&atari_config);
+        if (atari_ret != ESP_OK) {
+            printf("Failed to init Atari ST: %s\n", esp_err_to_name(atari_ret));
+            return false;
+        }
+
+        // Run in a FreeRTOS task
+        BaseType_t task_ret = xTaskCreate(atari_st_run_task, "atari_st", 16384, NULL, 5, &s_atari_task_handle);
+        if (task_ret == pdPASS) {
+            printf("Atari ST emulator running. Press Ctrl+C in UART to stop.\n");
+            if (atari_floppy_path) {
+                printf("Floppy A: %s\n", atari_floppy_path);
+            }
+            printf("\n");
+            while (s_atari_task_handle != NULL) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            return false;  // Return to BIOS shell
+        } else {
+            printf("Failed to start Atari ST task\n");
+            atari_st_destroy();
+            return false;
+        }
+    }
+
+    // ---- Amiga boot handler ----
+    if (selection == 8) {
+        if (!amiga_kick_found) {
+            printf("\nNo Kickstart ROM found. Place kick.rom in /sdcard/amiga/\n");
+            return false;
+        }
+        printf("\nBooting Amiga...\n\n");
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("Booting Amiga...\n\n");
+        } else if (lcd_console_is_initialized()) {
+            lcd_console_clear();
+            lcd_console_print("Booting Amiga...\n\n");
+        }
+
+        // Initialize video card GPU for display output
+        if (!video_card_is_initialized()) {
+            esp_err_t vid_ret = video_card_init();
+            if (vid_ret != ESP_OK) {
+                printf("Warning: Video card init failed: %s\n", esp_err_to_name(vid_ret));
+            }
+        }
+
+        amiga_config_t amiga_config = {
+            .chip_ram_size = AMIGA_CHIP_RAM_DEFAULT,
+            .slow_ram_enabled = false,
+            .kick_path = amiga_kick_path,
+            .floppy_path = {NULL, NULL, NULL, NULL},
+            .hdf_path = {NULL, NULL},
+            .pal_mode = true,
+        };
+        if (amiga_floppy_path) {
+            amiga_config.floppy_path[0] = amiga_floppy_path;
+        }
+        if (amiga_hdf_path) {
+            amiga_config.hdf_path[0] = amiga_hdf_path;
+        }
+
+        esp_err_t amiga_ret = amiga_init(&amiga_config);
+        if (amiga_ret != ESP_OK) {
+            printf("Failed to init Amiga: %s\n", esp_err_to_name(amiga_ret));
+            return false;
+        }
+
+        // Run in a FreeRTOS task
+        BaseType_t task_ret = xTaskCreate(amiga_run_task, "amiga", 16384, NULL, 5, &s_amiga_task_handle);
+        if (task_ret == pdPASS) {
+            printf("Amiga emulator running. Press Ctrl+C in UART to stop.\n");
+            if (amiga_floppy_path) {
+                printf("Floppy DF0: %s\n", amiga_floppy_path);
+            }
+            if (amiga_hdf_path) {
+                printf("Hard disk: %s\n", amiga_hdf_path);
+            }
+            printf("\n");
+            while (s_amiga_task_handle != NULL) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            return false;  // Return to BIOS shell
+        } else {
+            printf("Failed to start Amiga task\n");
+            amiga_destroy();
+            return false;
+        }
+    }
+
+    if (selection != 1 || !os_exists) {
+        return false;
+    }
+
+    // User chose to boot M68K OS (selection == 1)
     printf("\nBooting M68K-OS...\n\n");
-    if (lcd_console_is_initialized()) {
+    if (video_card_is_initialized()) {
+        video_card_text_clear();
+        video_card_print("Booting M68K-OS...\n\n");
+    } else if (lcd_console_is_initialized()) {
         lcd_console_clear();
         lcd_console_print("Booting M68K-OS...\n\n");
     }
+
+    // Initialize GPU video card for M68K-OS
+    if (!video_card_is_initialized()) {
+        esp_err_t vid_ret = video_card_init();
+        if (vid_ret == ESP_OK) {
+            printf("Video card GPU initialized for M68K-OS\n");
+        } else {
+            printf("Warning: Video card init failed: %s\n", esp_err_to_name(vid_ret));
+        }
+    }
+    // Set emulator memory read callback so GPU can read vertex/index data from M68K RAM
+    video_card_set_emu_read(m68k_read_memory_8);
     
     long file_size = st.st_size;
     if (file_size <= 0 || file_size > 16 * 1024 * 1024) {
@@ -1656,6 +2222,160 @@ static int cmd_load_from_sd(int argc, char **argv) {
     return 0;
 }
 
+// Background task for loadrun - runs M68K continuously until halted
+static void loadrun_task(void *arg) {
+    printf("loadrun: M68K execution started\n");
+    while (true) {
+        m68k_run(1000);
+        if (m68k_is_halted()) {
+            printf("loadrun: M68K halted\n");
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    printf("loadrun: task ended\n");
+    vTaskDelete(NULL);
+}
+
+// Helper: detect M68K vector table in first 8 bytes (big-endian SP at 0, PC at 4)
+static bool detect_vector_table(const uint8_t *data, uint32_t size, uint32_t *out_sp, uint32_t *out_pc) {
+    if (size < 8) return false;
+
+    // Read big-endian SP (bytes 0-3) and PC (bytes 4-7)
+    uint32_t sp = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                  ((uint32_t)data[2] << 8)  | data[3];
+    uint32_t pc = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
+                  ((uint32_t)data[6] << 8)  | data[7];
+
+    // Heuristic: SP should be even, non-zero, within 16MB RAM
+    // PC should be even, non-zero, within 16MB, and >= 8 (past vectors)
+    if (sp == 0 || pc == 0) return false;
+    if (sp & 1) return false;       // SP must be even
+    if (pc & 1) return false;       // PC must be even
+    if (sp > 0x01000000) return false; // SP within 16MB
+    if (pc > 0x01000000) return false; // PC within 16MB
+    if (pc < 8) return false;         // PC past vector table itself
+
+    *out_sp = sp;
+    *out_pc = pc;
+    return true;
+}
+
+static int cmd_loadrun(int argc, char **argv) {
+    if (!sd_mounted) {
+        printf("SD card not mounted. Use 'sdmount' first.\n");
+        return 1;
+    }
+    if (argc < 2) {
+        printf("Usage: loadrun <filename> [addr]\n");
+        printf("  Loads a M68K binary from SD card and immediately runs it.\n");
+        printf("  Auto-detects vector table (SP+PC in first 8 bytes).\n");
+        printf("  If no vector table: loads at [addr] (default 0x1000) and runs.\n");
+        printf("Examples:\n");
+        printf("  loadrun 3d_demo.bin       - vector table program\n");
+        printf("  loadrun program.bin 1000  - raw code at 0x1000\n");
+        return 1;
+    }
+
+    char filepath[300];
+    if (argv[1][0] == '/') {
+        snprintf(filepath, sizeof(filepath), "%s", argv[1]);
+    } else {
+        snprintf(filepath, sizeof(filepath), "/sdcard/%s", argv[1]);
+    }
+
+    // Default load address for non-vector-table programs
+    uint32_t raw_load_addr = 0x1000;
+    if (argc >= 3) {
+        raw_load_addr = strtol(argv[2], NULL, 16);
+    }
+
+    FILE *file = fopen(filepath, "rb");
+    if (file == NULL) {
+        printf("Failed to open file: %s\n", filepath);
+        return 1;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (file_size <= 0 || file_size > 16 * 1024 * 1024) {
+        printf("Invalid file size: %ld bytes\n", file_size);
+        fclose(file);
+        return 1;
+    }
+
+    uint8_t *buffer = malloc(file_size);
+    if (buffer == NULL) {
+        printf("Failed to allocate %ld bytes\n", file_size);
+        fclose(file);
+        return 1;
+    }
+
+    size_t bytes_read = fread(buffer, 1, file_size, file);
+    fclose(file);
+
+    if ((long)bytes_read != file_size) {
+        printf("Failed to read file: got %d bytes, expected %ld\n", (int)bytes_read, file_size);
+        free(buffer);
+        return 1;
+    }
+
+    printf("Loaded %s (%ld bytes)\n", argv[1], file_size);
+
+    // Detect vector table
+    uint32_t init_sp = 0, init_pc = 0;
+    bool has_vectors = detect_vector_table(buffer, (uint32_t)file_size, &init_sp, &init_pc);
+
+    if (has_vectors) {
+        printf("  Vector table detected: SP=0x%08lX PC=0x%08lX\n",
+               (unsigned long)init_sp, (unsigned long)init_pc);
+        // Load at address 0 (vectors + code together)
+        m68k_load_program(buffer, file_size, 0x0000);
+        free(buffer);
+
+        // Reset CPU first (clears all state), then override SP/PC
+        m68k_reset();
+        // m68k_reset already reads vectors from address 0, which now contain our program's vectors.
+        // But let's be explicit to ensure correctness:
+        m68k_set_reg(M68K_REG_A7, init_sp);
+        m68k_set_reg(M68K_REG_SP, init_sp);
+        m68k_set_reg(M68K_REG_PC, init_pc);
+        printf("  CPU reset: SP=0x%08lX PC=0x%08lX\n",
+               (unsigned long)init_sp, (unsigned long)init_pc);
+    } else {
+        printf("  No vector table - loading at 0x%08lX\n", (unsigned long)raw_load_addr);
+        m68k_load_program(buffer, file_size, raw_load_addr);
+        free(buffer);
+
+        // Don't do full reset (would read address 0 as SP/PC which may be garbage).
+        // Just set PC to load address and SP to a reasonable default.
+        m68k_set_reg(M68K_REG_A7, 0x00C00000);
+        m68k_set_reg(M68K_REG_SP, 0x00C00000);
+        m68k_set_reg(M68K_REG_PC, raw_load_addr);
+        printf("  CPU: SP=0x00C00000 PC=0x%08lX\n", (unsigned long)raw_load_addr);
+    }
+
+    // Start execution in background task
+    printf("Starting execution...\n");
+    BaseType_t ret = xTaskCreate(
+        loadrun_task,
+        "loadrun",
+        8192,
+        NULL,
+        5,
+        NULL
+    );
+
+    if (ret != pdPASS) {
+        printf("Failed to create execution task\n");
+        return 1;
+    }
+
+    return 0;
+}
+
 static void register_m68k_commands(void) {
     const esp_console_cmd_t init_cmd = {
         .command = "init",
@@ -1754,6 +2474,14 @@ static void register_m68k_commands(void) {
         .func = &cmd_load_from_sd,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&loadsd_cmd));
+
+    const esp_console_cmd_t loadrun_cmd = {
+        .command = "loadrun",
+        .help = "Load & run M68K program (auto-detects vector table)",
+        .hint = "<filename> [addr]",
+        .func = &cmd_loadrun,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&loadrun_cmd));
 }
 
 static void initialize_console(void) {
@@ -2329,18 +3057,23 @@ static int cmd_mkdisk(int argc, char **argv) {
 
 static int cmd_switch(int argc, char **argv) {
     if (argc < 2) {
-        console_printf("Current CPU: %s\n", 
-                       active_cpu == ACTIVE_CPU_M68K ? "M68K" : "i8086");
-        console_printf("Usage: switch <m68k|i8086>\n");
+        const char *name = "M68K";
+        if (active_cpu == ACTIVE_CPU_I8086) name = "i8086";
+        else if (active_cpu == ACTIVE_CPU_6502) name = "6502";
+        console_printf("Current CPU: %s\n", name);
+        console_printf("Usage: switch <m68k|i8086|6502>\n");
         return 0;
     }
-    
+
     if (strcasecmp(argv[1], "m68k") == 0) {
         active_cpu = ACTIVE_CPU_M68K;
         console_printf("Switched to M68K emulator\n");
     } else if (strcasecmp(argv[1], "i8086") == 0 || strcasecmp(argv[1], "86") == 0) {
         active_cpu = ACTIVE_CPU_I8086;
         console_printf("Switched to i8086 emulator\n");
+    } else if (strcasecmp(argv[1], "6502") == 0) {
+        active_cpu = ACTIVE_CPU_6502;
+        console_printf("Switched to MOS 6502 emulator\n");
     } else {
         console_printf("Unknown CPU: %s\n", argv[1]);
         return 1;
@@ -2355,19 +3088,210 @@ static int cmd_run86(int argc, char **argv) {
         return 1;
     }
     
-    console_printf("=== i8086 PC Emulator ===\n");
-    console_printf("NOTICE: This is a framework implementation.\n");
-    console_printf("Full i8086 emulation requires porting:\n");
-    console_printf("  - FabGL i8086 CPU core (i8086.cpp)\n");
-    console_printf("  - PC BIOS (INT 10h/13h/16h handlers)\n");
-    console_printf("  - PIC8259, PIT8253, i8042, MC146818\n");
-    console_printf("\n");
-    console_printf("Current status: Framework ready\n");
-    console_printf("Disk system: Functional\n");
-    console_printf("CPU emulation: Not yet implemented\n");
-    console_printf("\n");
-    console_printf("See I8086_EMULATOR_README.md for porting guide\n");
+    // Parse optional cycle count
+    uint32_t count = 0;  // 0 = run continuously
+    if (argc >= 2) {
+        count = strtoul(argv[1], NULL, 0);
+    }
     
+    if (count > 0) {
+        // Run a specific number of instructions
+        console_printf("Running %lu i8086 instructions...\n", (unsigned long)count);
+        uint32_t executed = i86_run(count);
+        console_printf("Executed %lu instructions.\n", (unsigned long)executed);
+    } else {
+        // Boot and run continuously
+        console_printf("Booting i8086 PC emulator...\n");
+        console_printf("Press Ctrl+C to stop.\n\n");
+        i86_boot_and_run();
+    }
+    
+    return 0;
+}
+
+static void i86_run_task(void *arg) {
+    i86_boot_and_run();
+    s_i86_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ---- Atari ST emulator task and commands ----
+
+static void atari_st_run_task(void *arg) {
+    atari_st_run();  // Runs until stopped (Ctrl+C or atari_st_stop())
+    atari_st_destroy();
+    printf("Atari ST emulator exited.\n");
+    s_atari_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static int cmd_stop_atari(int argc, char **argv) {
+    if (!atari_st_is_running()) {
+        console_printf("Atari ST is not running.\n");
+        return 1;
+    }
+    atari_st_stop();
+    console_printf("Atari ST emulator stopping...\n");
+    return 0;
+}
+
+static int cmd_state_atari(int argc, char **argv) {
+    char buf[512];
+    atari_st_get_state(buf, sizeof(buf));
+    console_printf("%s", buf);
+    return 0;
+}
+
+// ---- Amiga emulator task and commands ----
+static void amiga_run_task(void *arg) {
+    amiga_run();  // Runs until stopped (Ctrl+C or amiga_stop())
+    amiga_destroy();
+    printf("Amiga emulator exited.\n");
+    s_amiga_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static int cmd_stop_amiga(int argc, char **argv) {
+    if (!amiga_is_running()) {
+        console_printf("Amiga is not running.\n");
+        return 1;
+    }
+    amiga_stop();
+    console_printf("Amiga emulator stopping...\n");
+    return 0;
+}
+
+static int cmd_state_amiga(int argc, char **argv) {
+    char buf[512];
+    amiga_get_state(buf, sizeof(buf));
+    console_printf("%s", buf);
+    return 0;
+}
+
+static int cmd_amiga_floppy(int argc, char **argv) {
+    if (argc < 2) {
+        console_printf("Usage: amigafloppy <path> [drive]\n");
+        console_printf("  drive: 0-3 (default 0)\n");
+        return 1;
+    }
+    int drive = 0;
+    if (argc >= 3) {
+        drive = atoi(argv[2]);
+        if (drive < 0 || drive > 3) {
+            console_printf("Invalid drive number (0-3)\n");
+            return 1;
+        }
+    }
+    if (strcmp(argv[1], "eject") == 0) {
+        amiga_eject_floppy(drive);
+        console_printf("Ejected floppy from DF%d\n", drive);
+        return 0;
+    }
+    esp_err_t ret = amiga_insert_floppy(drive, argv[1]);
+    if (ret == ESP_OK) {
+        console_printf("Inserted %s in DF%d\n", argv[1], drive);
+    } else {
+        console_printf("Failed to insert floppy: %s\n", esp_err_to_name(ret));
+    }
+    return (ret == ESP_OK) ? 0 : 1;
+}
+
+static int cmd_amiga_hdf(int argc, char **argv) {
+    if (argc < 2) {
+        console_printf("Usage: amigahdf <path> [unit]\n");
+        console_printf("  unit: 0-1 (default 0)\n");
+        return 1;
+    }
+    int unit = 0;
+    if (argc >= 3) {
+        unit = atoi(argv[2]);
+        if (unit < 0 || unit > 1) {
+            console_printf("Invalid unit number (0-1)\n");
+            return 1;
+        }
+    }
+    if (strcmp(argv[1], "eject") == 0) {
+        amiga_unmount_hdf(unit);
+        console_printf("Unmounted HDF from unit %d\n", unit);
+        return 0;
+    }
+    esp_err_t ret = amiga_mount_hdf(unit, argv[1]);
+    if (ret == ESP_OK) {
+        console_printf("Mounted %s as HD%d\n", argv[1], unit);
+    } else {
+        console_printf("Failed to mount HDF: %s\n", esp_err_to_name(ret));
+    }
+    return (ret == ESP_OK) ? 0 : 1;
+}
+
+static int cmd_boot86(int argc, char **argv) {
+    if (!i86_is_initialized()) {
+        // Auto-initialize
+        i86_config_t config = {
+            .ram_size = I86_RAM_SIZE,
+            .cpu_freq_mhz = 8,
+            .enable_fpu = false,
+            .enable_sound = false,
+            .boot_disk = NULL,
+        };
+        if (i86_init(&config) != ESP_OK) {
+            console_printf("Failed to initialize i8086.\n");
+            return 1;
+        }
+    }
+    
+    // Check if a disk image argument is provided
+    if (argc >= 2) {
+        const char *disk_path = argv[1];
+        // Auto-mount as drive A: or C: depending on type
+        disk_type_t type = disk_detect_type(disk_path);
+        int drive = (type == DISK_TYPE_HARD_DISK) ? 2 : 0;
+        
+        if (i86_mount_disk(drive, disk_path) != ESP_OK) {
+            console_printf("Failed to mount disk: %s\n", disk_path);
+            return 1;
+        }
+        console_printf("Mounted %s as drive %c:\n", disk_path,
+                       drive < 2 ? 'A' + drive : 'C' + (drive - 2));
+    }
+    
+    // Check at least one disk is mounted
+    bool any_disk = false;
+    for (int i = 0; i < MAX_DISK_DRIVES; i++) {
+        if (disk_is_mounted(i)) {
+            any_disk = true;
+            break;
+        }
+    }
+    if (!any_disk) {
+        console_printf("No disk mounted. Usage: boot86 <disk_image.img>\n");
+        console_printf("Or mount a disk first: mount A /sdcard/freedos.img\n");
+        return 1;
+    }
+    
+    if (s_i86_task_handle != NULL) {
+        console_printf("i8086 emulator is already running.\n");
+        return 1;
+    }
+    
+    // Run in a FreeRTOS task
+    console_printf("Starting i8086 PC emulator...\n");
+    BaseType_t ret = xTaskCreate(i86_run_task, "i8086_emu", 16384, NULL, 5, &s_i86_task_handle);
+    if (ret != pdPASS) {
+        console_printf("Failed to create emulator task.\n");
+        return 1;
+    }
+    
+    return 0;
+}
+
+static int cmd_stop86(int argc, char **argv) {
+    if (!i86_is_initialized()) {
+        console_printf("i8086 not initialized.\n");
+        return 1;
+    }
+    i86_stop();
+    console_printf("i8086 emulator stopped.\n");
     return 0;
 }
 
@@ -2438,11 +3362,418 @@ static void register_i8086_commands(void) {
     
     const esp_console_cmd_t run86_cmd = {
         .command = "run86",
-        .help = "Run i8086 PC emulator",
-        .hint = NULL,
+        .help = "Run i8086 emulator [count]",
+        .hint = "[instructions]",
         .func = &cmd_run86,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&run86_cmd));
+
+    const esp_console_cmd_t boot86_cmd = {
+        .command = "boot86",
+        .help = "Boot i8086 PC from disk image",
+        .hint = "[image_path]",
+        .func = &cmd_boot86,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&boot86_cmd));
+
+    const esp_console_cmd_t stop86_cmd = {
+        .command = "stop86",
+        .help = "Stop i8086 emulator",
+        .hint = NULL,
+        .func = &cmd_stop86,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stop86_cmd));
+}
+
+// ============================================================================
+// MOS 6502 Emulator Commands
+// ============================================================================
+
+static int cmd_init6502(int argc, char **argv) {
+    esp_err_t err = mos6502_emu_init();
+    if (err == ESP_OK) {
+        console_printf("MOS 6502 emulator initialized (64KB RAM)\n");
+    } else {
+        console_printf("Failed to initialize 6502: %s\n", esp_err_to_name(err));
+    }
+    return 0;
+}
+
+static int cmd_reset6502(int argc, char **argv) {
+    if (!mos6502_emu_is_initialized()) {
+        console_printf("6502 not initialized. Run 'init6502' first.\n");
+        return 1;
+    }
+    mos6502_emu_reset();
+    char buf[256];
+    mos6502_emu_get_state(buf, sizeof(buf));
+    console_printf("%s", buf);
+    return 0;
+}
+
+static int cmd_state6502(int argc, char **argv) {
+    char buf[256];
+    mos6502_emu_get_state(buf, sizeof(buf));
+    console_printf("%s", buf);
+    return 0;
+}
+
+static int cmd_step6502(int argc, char **argv) {
+    if (!mos6502_emu_is_initialized()) {
+        console_printf("6502 not initialized.\n");
+        return 1;
+    }
+    mos6502_emu_step();
+    char buf[256];
+    mos6502_emu_get_state(buf, sizeof(buf));
+    console_printf("%s", buf);
+    return 0;
+}
+
+static int cmd_dump6502(int argc, char **argv) {
+    uint32_t addr = 0;
+    uint32_t len = 128;
+    if (argc > 1) addr = strtoul(argv[1], NULL, 16);
+    if (argc > 2) len = strtoul(argv[2], NULL, 0);
+    mos6502_emu_dump_memory(addr, len);
+    return 0;
+}
+
+static int cmd_load6502(int argc, char **argv) {
+    if (argc < 2) {
+        console_printf("Usage: load6502 <file> [address]\n");
+        console_printf("  Loads binary file from SD card into 6502 memory\n");
+        console_printf("  Default address: $E000 (ROM area)\n");
+        return 1;
+    }
+
+    if (!mos6502_emu_is_initialized()) {
+        console_printf("6502 not initialized. Running init6502...\n");
+        mos6502_emu_init();
+    }
+
+    uint32_t load_addr = 0xE000;
+    if (argc > 2) load_addr = strtoul(argv[2], NULL, 16);
+
+    // Build path
+    char path[128];
+    if (argv[1][0] == '/') {
+        snprintf(path, sizeof(path), "%s", argv[1]);
+    } else {
+        snprintf(path, sizeof(path), "/sdcard/%s", argv[1]);
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        console_printf("Cannot open file: %s\n", path);
+        return 1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    uint8_t *buf = malloc(fsize);
+    if (!buf) {
+        console_printf("Out of memory for %ld bytes\n", fsize);
+        fclose(f);
+        return 1;
+    }
+
+    fread(buf, 1, fsize, f);
+    fclose(f);
+
+    mos6502_emu_load_program(buf, fsize, load_addr);
+    free(buf);
+
+    console_printf("Loaded %ld bytes from %s at $%04X\n", fsize, path, (uint16_t)load_addr);
+    return 0;
+}
+
+static void mos6502_run_task(void *arg) {
+    // C64 runs at ~1MHz. KERNAL boot takes ~1-2 seconds.
+    // Suppress rendering during boot so the BASIC screen appears instantly.
+    const uint32_t BATCH_INSTRUCTIONS = 500;
+    const uint32_t BOOT_CYCLES = 2000000;  // ~2 seconds at 1MHz
+    uint32_t total_cycles = 0;
+    uint32_t cycles_since_render = 0;
+    uint32_t poll_counter = 0;
+    bool boot_complete = false;
+
+    // Switch video card from TEXT mode to GFX mode so the C64 renderer
+    // can use back-buffer drawing + present() for double-buffered output.
+    // Without this, present() is a no-op and the LCD keeps showing the
+    // text-mode welcome screen instead of the C64 display.
+    if (video_card_is_initialized()) {
+        video_card_enter_gfx_mode();
+        video_card_present();  // Show initial black frame
+    }
+
+    // Phase 1: KERNAL boot - run CPU fast without rendering
+    // This lets the BASIC startup message appear all at once
+    while (!boot_complete) {
+        uint64_t cycles = mos6502_emu_run(BATCH_INSTRUCTIONS);
+        if (mos6502_emu_is_halted()) {
+            printf("6502 halted during boot\n");
+            goto task_exit;
+        }
+        mos6502_emu_tick((uint32_t)cycles);
+        total_cycles += (uint32_t)cycles;
+
+        // Yield every ~50k cycles so watchdog doesn't trigger
+        cycles_since_render += (uint32_t)cycles;
+        if (cycles_since_render >= 50000) {
+            cycles_since_render = 0;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        if (total_cycles >= BOOT_CYCLES) {
+            boot_complete = true;
+        }
+    }
+
+    // Phase 2: Boot complete - render first frame instantly on both displays
+    printf("\033[2J\033[H");  // Clear serial terminal
+    fflush(stdout);
+    mos6502_emu_render_screen();  // Full screen draw with BASIC prompt
+    cycles_since_render = 0;
+
+    // Phase 3: Normal operation - render at 60Hz, poll keyboard, handle input
+    while (true) {
+        uint64_t cycles = mos6502_emu_run(BATCH_INSTRUCTIONS);
+
+        if (mos6502_emu_is_halted()) {
+            printf("\033[27;1H6502 halted\n");
+            break;
+        }
+
+        mos6502_emu_tick((uint32_t)cycles);
+        cycles_since_render += (uint32_t)cycles;
+
+        // Poll keyboard every ~4 batches
+        if (++poll_counter >= 4) {
+            poll_counter = 0;
+            mos6502_emu_poll_keyboard();
+            if (mos6502_emu_exit_requested()) {
+                printf("\033[27;1H\nExiting C64 emulator...\n");
+                fflush(stdout);
+                break;
+            }
+        }
+
+        // ~60Hz screen refresh
+        if (cycles_since_render >= 16667) {
+            cycles_since_render = 0;
+            mos6502_emu_render_screen();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+task_exit:
+    // Restore terminal
+    printf("\033[2J\033[H");  // Clear screen
+    printf("Returned to BIOS.\n");
+    fflush(stdout);
+    s_6502_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static int cmd_run6502(int argc, char **argv) {
+    if (!mos6502_emu_is_initialized()) {
+        console_printf("6502 not initialized.\n");
+        return 1;
+    }
+
+    if (argc > 1) {
+        uint32_t count = strtoul(argv[1], NULL, 0);
+        mos6502_emu_run(count);
+        char buf[256];
+        mos6502_emu_get_state(buf, sizeof(buf));
+        console_printf("%s", buf);
+    } else {
+        if (s_6502_task_handle) {
+            console_printf("6502 already running\n");
+            return 0;
+        }
+        mos6502_emu_reset();
+        xTaskCreate(mos6502_run_task, "6502_run", 8192, NULL, 5, &s_6502_task_handle);
+        console_printf("6502 running in background\n");
+    }
+    return 0;
+}
+
+static int cmd_stop6502(int argc, char **argv) {
+    if (s_6502_task_handle) {
+        mos6502_emu_stop();
+        console_printf("6502 stopped\n");
+    } else {
+        console_printf("6502 not running\n");
+    }
+    return 0;
+}
+
+static int cmd_poke6502(int argc, char **argv) {
+    if (argc < 3) {
+        console_printf("Usage: poke6502 <addr> <byte>\n");
+        return 1;
+    }
+    uint16_t addr = (uint16_t)strtoul(argv[1], NULL, 16);
+    uint8_t val = (uint8_t)strtoul(argv[2], NULL, 16);
+    mos6502_emu_write_memory(addr, val);
+    console_printf("$%04X = $%02X\n", addr, val);
+    return 0;
+}
+
+// ============================================================================
+// Video Card Commands
+// ============================================================================
+
+static int cmd_vinit(int argc, char **argv) {
+    esp_err_t err = video_card_init();
+    if (err == ESP_OK) {
+        console_printf("Video card initialized (480x320, RGB565, double-buffered)\n");
+    } else {
+        console_printf("Failed to initialize video card: %s\n", esp_err_to_name(err));
+    }
+    return 0;
+}
+
+static int cmd_vtest(int argc, char **argv) {
+    if (!video_card_is_initialized()) {
+        console_printf("Video card not initialized. Run 'vinit' first.\n");
+        return 1;
+    }
+
+    // Set mode and enable
+    video_card_write(VID_REG_MODE, VID_MODE_480x320x16, 4);
+    video_card_write(VID_REG_COMMAND, VID_CMD_INIT, 4);
+
+    // Clear to dark blue
+    video_card_write(VID_REG_BG_COLOR, 0x0011, 4);
+    video_card_write(VID_REG_COMMAND, VID_CMD_CLEAR, 4);
+
+    // Draw some shapes
+    // Red filled rectangle
+    video_card_write(VID_REG_DRAW_X, 20, 4);
+    video_card_write(VID_REG_DRAW_Y, 20, 4);
+    video_card_write(VID_REG_DRAW_W, 100, 4);
+    video_card_write(VID_REG_DRAW_H, 80, 4);
+    video_card_write(VID_REG_DRAW_COLOR, 0xF800, 4);
+    video_card_write(VID_REG_COMMAND, VID_CMD_FILL_RECT, 4);
+
+    // Green filled rectangle
+    video_card_write(VID_REG_DRAW_X, 150, 4);
+    video_card_write(VID_REG_DRAW_Y, 50, 4);
+    video_card_write(VID_REG_DRAW_W, 80, 4);
+    video_card_write(VID_REG_DRAW_H, 60, 4);
+    video_card_write(VID_REG_DRAW_COLOR, 0x07E0, 4);
+    video_card_write(VID_REG_COMMAND, VID_CMD_FILL_RECT, 4);
+
+    // Blue circle
+    video_card_write(VID_REG_DRAW_X, 350, 4);
+    video_card_write(VID_REG_DRAW_Y, 160, 4);
+    video_card_write(VID_REG_DRAW_W, 60, 4);
+    video_card_write(VID_REG_DRAW_COLOR, 0x001F, 4);
+    video_card_write(VID_REG_COMMAND, VID_CMD_FILL_CIRCLE, 4);
+
+    // White diagonal lines
+    for (int i = 0; i < 8; i++) {
+        video_card_write(VID_REG_DRAW_X, 0, 4);
+        video_card_write(VID_REG_DRAW_Y, i * 40, 4);
+        video_card_write(VID_REG_DRAW_W, 479, 4);
+        video_card_write(VID_REG_DRAW_H, 319 - i * 40, 4);
+        video_card_write(VID_REG_DRAW_COLOR, 0xFFFF, 4);
+        video_card_write(VID_REG_COMMAND, VID_CMD_DRAW_LINE, 4);
+    }
+
+    // Yellow horizontal line
+    video_card_write(VID_REG_DRAW_X, 0, 4);
+    video_card_write(VID_REG_DRAW_Y, 160, 4);
+    video_card_write(VID_REG_DRAW_W, 480, 4);
+    video_card_write(VID_REG_DRAW_COLOR, 0xFFE0, 4);
+    video_card_write(VID_REG_COMMAND, VID_CMD_HLINE, 4);
+
+    // Flip to display
+    video_card_write(VID_REG_COMMAND, VID_CMD_FLIP, 4);
+
+    console_printf("Video test pattern drawn\n");
+    return 0;
+}
+
+static int cmd_vstatus(int argc, char **argv) {
+    if (!video_card_is_initialized()) {
+        console_printf("Video card: not initialized\n");
+        return 0;
+    }
+    uint32_t status = video_card_read(VID_REG_STATUS, 4);
+    uint32_t width = video_card_read(VID_REG_WIDTH, 4);
+    uint32_t height = video_card_read(VID_REG_HEIGHT, 4);
+    uint32_t frames = video_card_get_frame_count();
+
+    console_printf("Video Card Status:\n");
+    console_printf("  Resolution: %dx%d\n", width, height);
+    console_printf("  Status: 0x%02X [%s%s%s]\n", status,
+                   (status & VID_STATUS_READY) ? "READY " : "",
+                   (status & VID_STATUS_VBLANK) ? "VBLANK " : "",
+                   (status & VID_STATUS_GFX_MODE) ? "GFX" : "TEXT");
+    console_printf("  Frames: %u\n", frames);
+    return 0;
+}
+
+static int cmd_voff(int argc, char **argv) {
+    if (video_card_is_initialized()) {
+        video_card_deinit();
+        console_printf("Video card disabled\n");
+    } else {
+        console_printf("Video card not active\n");
+    }
+    return 0;
+}
+
+// ============================================================================
+// 6502 + Video Command Registration
+// ============================================================================
+
+static void register_6502_commands(void) {
+    const esp_console_cmd_t cmds[] = {
+        { .command = "init6502", .help = "Initialize MOS 6502 CPU emulator",
+          .func = &cmd_init6502 },
+        { .command = "reset6502", .help = "Reset 6502 CPU",
+          .func = &cmd_reset6502 },
+        { .command = "state6502", .help = "Show 6502 CPU state",
+          .func = &cmd_state6502 },
+        { .command = "step6502", .help = "Single-step 6502",
+          .func = &cmd_step6502 },
+        { .command = "run6502", .help = "Run 6502 [count] or continuously",
+          .hint = "[count]", .func = &cmd_run6502 },
+        { .command = "stop6502", .help = "Stop 6502 execution",
+          .func = &cmd_stop6502 },
+        { .command = "load6502", .help = "Load binary into 6502 memory",
+          .hint = "<file> [addr]", .func = &cmd_load6502 },
+        { .command = "dump6502", .help = "Dump 6502 memory",
+          .hint = "[addr] [len]", .func = &cmd_dump6502 },
+        { .command = "poke6502", .help = "Write byte to 6502 memory",
+          .hint = "<addr> <byte>", .func = &cmd_poke6502 },
+    };
+    for (int i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++) {
+        ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
+    }
+}
+
+static void register_video_commands(void) {
+    const esp_console_cmd_t cmds[] = {
+        { .command = "vinit", .help = "Initialize video card (480x320 GPU)",
+          .func = &cmd_vinit },
+        { .command = "vtest", .help = "Draw video test pattern",
+          .func = &cmd_vtest },
+        { .command = "vstatus", .help = "Show video card status",
+          .func = &cmd_vstatus },
+        { .command = "voff", .help = "Disable video card",
+          .func = &cmd_voff },
+    };
+    for (int i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++) {
+        ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
+    }
 }
 
 static int cmd_appstop(int argc, char **argv) {
@@ -2723,6 +4054,11 @@ static char* read_line_dual_input(const char *prompt) {
             c = ps2_keyboard_read();
         }
         
+        // Check USB keyboard input
+        if (c == 0 && usb_keyboard_is_initialized() && usb_keyboard_available()) {
+            c = usb_keyboard_read();
+        }
+        
         // If no PS/2 keyboard input, check UART/USB Serial
         if (c == 0) {
             int uart_char = -1;
@@ -2934,11 +4270,63 @@ void app_main(void) {
     register_linux_commands();  // Register ls, cd, pwd, cat, etc. first
     register_m68k_commands();
     register_i8086_commands();
+    register_6502_commands();
+    register_video_commands();
     register_i386_commands();       // Register i386 emulator commands
     register_bluetooth_commands();  // Register Bluetooth commands
     register_wifi_ftp_commands();   // Register WiFi and FTP commands
     register_app_commands();
     
+    // Register Atari ST commands
+    const esp_console_cmd_t stop_atari_cmd = {
+        .command = "stopatari",
+        .help = "Stop Atari ST emulator",
+        .hint = NULL,
+        .func = &cmd_stop_atari,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stop_atari_cmd));
+    
+    const esp_console_cmd_t state_atari_cmd = {
+        .command = "stateatari",
+        .help = "Show Atari ST emulator state",
+        .hint = NULL,
+        .func = &cmd_state_atari,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&state_atari_cmd));
+
+    // Register Amiga commands
+    const esp_console_cmd_t stop_amiga_cmd = {
+        .command = "stopamiga",
+        .help = "Stop Amiga emulator",
+        .hint = NULL,
+        .func = &cmd_stop_amiga,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stop_amiga_cmd));
+
+    const esp_console_cmd_t state_amiga_cmd = {
+        .command = "stateamiga",
+        .help = "Show Amiga emulator state",
+        .hint = NULL,
+        .func = &cmd_state_amiga,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&state_amiga_cmd));
+
+    const esp_console_cmd_t amiga_floppy_cmd = {
+        .command = "amigafloppy",
+        .help = "Insert/eject Amiga floppy: amigafloppy <path|eject> [drive]",
+        .hint = NULL,
+        .func = &cmd_amiga_floppy,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&amiga_floppy_cmd));
+
+    const esp_console_cmd_t amiga_hdf_cmd = {
+        .command = "amigahdf",
+        .help = "Mount/unmount Amiga HDF: amigahdf <path|eject> [unit]",
+        .hint = NULL,
+        .func = &cmd_amiga_hdf,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&amiga_hdf_cmd));
+
     // Register PS/2 test command
     const esp_console_cmd_t ps2test_cmd = {
         .command = "ps2test",
@@ -2988,6 +4376,16 @@ void app_main(void) {
     } else {
         printf("✗ PS/2 keyboard initialization failed: %s\n", esp_err_to_name(ret));
         printf("  Fallback to UART input\n");
+    }
+    
+    // Initialize USB HID keyboard (USB Type-A host port)
+    printf("Initializing USB keyboard...\n");
+    ret = usb_keyboard_init();
+    if (ret == ESP_OK) {
+        printf("✓ USB keyboard driver initialized (plug in USB keyboard)\n");
+    } else {
+        printf("✗ USB keyboard initialization failed: %s\n", esp_err_to_name(ret));
+        printf("  Continuing without USB keyboard support\n");
     }
     
     // Initialize WiFi with ESP32-C6 coprocessor (SDIO)
@@ -3092,7 +4490,22 @@ void app_main(void) {
     }
     
     // Clear splash and show ready prompt on LCD (only if OS didn't boot)
-    if (lcd_console_is_initialized()) {
+    // Guard: if video card is running, use it instead of lcd_console to avoid SPI contention
+    if (video_card_is_initialized()) {
+        video_card_text_clear();
+        video_card_print("M68K BIOS READY\n");
+        video_card_print("================\n\n");
+        char buf[64];
+        snprintf(buf, sizeof(buf), "CPU: 68000 @ 60MHz\n");
+        video_card_print(buf);
+        snprintf(buf, sizeof(buf), "RAM: %lu KB\n", 
+                 (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+        video_card_print(buf);
+        if (sd_mounted) {
+            video_card_print("SD:  Mounted\n");
+        }
+        video_card_print("\nType 'help' for commands\n\n");
+    } else if (lcd_console_is_initialized()) {
         lcd_console_clear();
         lcd_console_print("M68K BIOS READY\n");
         lcd_console_print("================\n\n");
