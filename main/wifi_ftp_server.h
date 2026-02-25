@@ -50,6 +50,13 @@ bool wifi_is_connected(void);
 esp_err_t wifi_get_ip(char *ip_str, size_t len);
 
 /**
+ * @brief Register a callback that mounts the SD card when the FTP server needs it.
+ *        The callback should return ESP_OK on success.
+ */
+typedef esp_err_t (*ftp_mount_sd_cb_t)(void);
+void ftp_server_set_mount_cb(ftp_mount_sd_cb_t cb);
+
+/**
  * @brief Initialize FTP server
  * 
  * @return ESP_OK on success, error code otherwise

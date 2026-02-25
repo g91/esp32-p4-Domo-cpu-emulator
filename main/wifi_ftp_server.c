@@ -18,6 +18,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "wifi_ftp_server.h"
+#include "ethernet_init.h"
 #include "ssh_debug_server.h"
 
 static const char *TAG = "WiFi_FTP";
@@ -39,6 +40,11 @@ static EventGroupHandle_t wifi_event_group;
 static int s_retry_num = 0;
 static bool wifi_connected = false;
 static TaskHandle_t ftp_task_handle = NULL;
+static ftp_mount_sd_cb_t s_mount_sd_cb = NULL;
+
+void ftp_server_set_mount_cb(ftp_mount_sd_cb_t cb) {
+    s_mount_sd_cb = cb;
+}
 
 // FTP server state
 typedef struct {
@@ -220,18 +226,21 @@ esp_err_t wifi_scan(void)
 
 bool wifi_is_connected(void)
 {
-    // Check actual WiFi connection status instead of internal flag
+    // Check WiFi first
     wifi_ap_record_t ap_info;
     esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
     if (ret == ESP_OK) {
-        // Also verify we have an IP address
         esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (netif) {
             esp_netif_ip_info_t ip_info;
             if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
-                return (ip_info.ip.addr != 0);  // Return true if we have a valid IP
+                if (ip_info.ip.addr != 0) return true;
             }
         }
+    }
+    // Also check Ethernet
+    if (ethernet_is_connected()) {
+        return true;
     }
     return false;
 }
@@ -242,18 +251,23 @@ esp_err_t wifi_get_ip(char *ip_str, size_t len)
         return ESP_ERR_INVALID_ARG;
     }
     
+    // Try WiFi first
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (!netif) {
-        return ESP_FAIL;
+    if (netif) {
+        esp_netif_ip_info_t ip_info;
+        esp_err_t ret = esp_netif_get_ip_info(netif, &ip_info);
+        if (ret == ESP_OK && ip_info.ip.addr != 0) {
+            snprintf(ip_str, len, IPSTR, IP2STR(&ip_info.ip));
+            return ESP_OK;
+        }
     }
     
-    esp_netif_ip_info_t ip_info;
-    esp_err_t ret = esp_netif_get_ip_info(netif, &ip_info);
-    if (ret == ESP_OK) {
-        snprintf(ip_str, len, IPSTR, IP2STR(&ip_info.ip));
+    // Fall back to Ethernet
+    if (ethernet_is_connected()) {
+        return ethernet_get_ip(ip_str, len);
     }
     
-    return ret;
+    return ESP_FAIL;
 }
 
 /* ====== FTP Server Functions ====== */
@@ -698,12 +712,24 @@ esp_err_t ftp_server_init(void)
         return ESP_FAIL;
     }
     
-    // Check if SD card mount point exists
+    // Check if SD card mount point exists; try auto-mounting if a callback is registered
     DIR *dir = opendir(FTP_ROOT_DIR);
     if (!dir) {
-        ESP_LOGE(TAG, "SD card not mounted at %s, cannot start FTP server", FTP_ROOT_DIR);
-        ESP_LOGE(TAG, "Please mount SD card first using 'sd_mount' command");
-        return ESP_FAIL;
+        if (s_mount_sd_cb) {
+            ESP_LOGI(TAG, "SD card not mounted - attempting auto-mount...");
+            esp_err_t mount_ret = s_mount_sd_cb();
+            if (mount_ret != ESP_OK) {
+                ESP_LOGE(TAG, "Auto-mount failed: %s", esp_err_to_name(mount_ret));
+                return ESP_FAIL;
+            }
+            ESP_LOGI(TAG, "SD card auto-mounted successfully");
+            dir = opendir(FTP_ROOT_DIR);
+        }
+        if (!dir) {
+            ESP_LOGE(TAG, "SD card not mounted at %s, cannot start FTP server", FTP_ROOT_DIR);
+            ESP_LOGE(TAG, "Please mount SD card first using 'sd_mount' command");
+            return ESP_FAIL;
+        }
     }
     closedir(dir);
     

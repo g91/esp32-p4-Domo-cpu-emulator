@@ -1,0 +1,119 @@
+# BasiliskII ESP32-P4 Component
+# Macintosh 68040 emulator (Basilisk II / UAE CPU engine)
+
+idf_component_register(
+    SRCS
+        # Platform-specific (ESP-IDF native)
+        "main_esp32.cpp"
+        "video_esp32.cpp"
+        "input_esp32.cpp"
+        "sys_esp32.cpp"
+        "prefs_esp32.cpp"
+        "xpram_esp32.cpp"
+        "timer_esp32.cpp"
+        "basilisk_utils.cpp"
+        "boot_gui_stub.cpp"
+
+        # Core emulator
+        "main.cpp"
+        "adb.cpp"
+        "audio.cpp"
+        "audio_dummy.cpp"
+        "cdrom.cpp"
+        "clip_dummy.cpp"
+        "disk.cpp"
+        "driver_stubs.cpp"
+        "emul_op.cpp"
+        "ether_dummy.cpp"
+        "macos_util.cpp"
+        "prefs.cpp"
+        "prefs_items.cpp"
+        "rom_patches.cpp"
+        "rsrc_patches.cpp"
+        "scsi_dummy.cpp"
+        "serial_dummy.cpp"
+        "slot_rom.cpp"
+        "sony.cpp"
+        "video.cpp"
+        "xpram.cpp"
+        "user_strings.cpp"
+        "user_strings_esp32.cpp"
+
+        # UAE CPU engine
+        "uae_cpu/basilisk_glue.cpp"
+        "uae_cpu/memory.cpp"
+        "uae_cpu/newcpu.cpp"
+        "uae_cpu/readcpu.cpp"
+        "uae_cpu/fpu/fpu_ieee.cpp"
+
+        # Generated CPU tables (very large files)
+        "uae_cpu/generated/cpuemu.cpp"
+        "uae_cpu/generated/cpuemu_nf.cpp"
+        "uae_cpu/generated/cpustbl.cpp"
+        "uae_cpu/generated/cpustbl_nf.cpp"
+        "uae_cpu/generated/cpudefs.cpp"
+
+    INCLUDE_DIRS
+        "include"
+        "uae_cpu"
+        "uae_cpu/fpu"
+        "uae_cpu/compiler"
+        "uae_cpu/generated"
+        "."
+
+    REQUIRES
+        freertos
+        esp_timer
+        heap
+        fatfs
+        sdmmc
+        log
+        newlib
+
+    PRIV_REQUIRES
+        vfs
+)
+
+# Compiler flags for BasiliskII
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    # Suppress warnings from upstream code (it's not our code to fix)
+    -Wno-unused-variable
+    -Wno-unused-function
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare
+    -Wno-format
+    -Wno-format-truncation
+    -Wno-missing-field-initializers
+    -Wno-parentheses
+    -Wno-narrowing
+    -Wno-address
+    -Wno-maybe-uninitialized
+    -Wno-implicit-fallthrough
+    -Wno-switch
+    -Wno-type-limits
+    -Wno-sequence-point
+    -Wno-misleading-indentation
+    -Wno-char-subscripts
+
+    # C++ specific
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-reorder>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-delete-non-virtual-dtor>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-class-memaccess>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
+)
+
+# BasiliskII configuration defines
+target_compile_definitions(${COMPONENT_LIB} PUBLIC
+    EMULATED_68K=1
+    REAL_ADDRESSING=0
+    DIRECT_ADDRESSING=0
+    ROM_IS_WRITE_PROTECTED=1
+    FPU_IEEE=1
+    HAVE_SIGINFO_T=0
+    X86_ASSEMBLY=0
+    OPTIMIZED_8BIT_MEMORY=0
+)
+
+# Don't include cpu_profiler.cpp by default (has Arduino deps) — exclude for now
+# It can be re-enabled after porting Serial.print -> write_log

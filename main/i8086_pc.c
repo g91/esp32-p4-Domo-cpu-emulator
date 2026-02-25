@@ -143,9 +143,13 @@ void pit_init(pit8253_t *pit) {
     for (int i = 0; i < 3; i++) {
         pit->ch[i].gate = true;    // Gates tied high on IBM PC (ch0, ch1)
         pit->ch[i].output = true;
-        pit->ch[i].reload = 0xFFFF;
-        pit->ch[i].counter = 0xFFFF;
+        // Default reload = 0 means 65536 (full count, ~18.2 Hz for ch0)
+        // BIOS POST will program the actual values via port I/O
+        pit->ch[i].reload = 0x10000;
+        pit->ch[i].counter = 0x10000;
         pit->ch[i].mode = PIT_MODE_SQUAREWAVE;
+        pit->ch[i].rw_mode = 3;    // LSB/MSB mode (standard)
+        pit->ch[i].loaded = true;  // Pre-loaded with default 65536 count
     }
 }
 
@@ -199,7 +203,7 @@ void pit_write(pit8253_t *pit, uint8_t port, uint8_t value) {
                     c->write_lsb = 1;
                 } else {
                     c->reload = (c->reload & 0x00FF) | ((uint16_t)value << 8);
-                    if (c->reload == 0) c->reload = 0xFFFF;
+                    if (c->reload == 0) c->reload = 0x10000; // 0 means 65536
                     c->counter = c->reload;
                     c->write_lsb = 0;
                     c->loaded = true;
@@ -245,7 +249,10 @@ void pit_tick(pit8253_t *pit, int ticks) {
         if (!c->gate || !c->loaded) continue;
 
         for (int t = 0; t < ticks; t++) {
-            if (c->counter == 0) {
+            // Mode 3 (square wave) decrements by 2 per tick, others by 1
+            uint32_t decrement = (c->mode == PIT_MODE_SQUAREWAVE) ? 2 : 1;
+
+            if (c->counter <= decrement) {
                 c->counter = c->reload;
                 // Trigger output change based on mode
                 switch (c->mode) {
@@ -253,7 +260,7 @@ void pit_tick(pit8253_t *pit, int ticks) {
                         c->output = true;
                         break;
                     case PIT_MODE_RATEGEN:
-                        c->output = true;   // Brief pulse
+                        c->output = true;   // Brief high pulse
                         break;
                     case PIT_MODE_SQUAREWAVE:
                         c->output = !c->output;
@@ -263,8 +270,8 @@ void pit_tick(pit8253_t *pit, int ticks) {
                         break;
                 }
             } else {
-                c->counter--;
-                if (c->mode == PIT_MODE_RATEGEN && c->counter == 1) {
+                c->counter -= decrement;
+                if (c->mode == PIT_MODE_RATEGEN && c->counter <= 1) {
                     c->output = false; // Low for one tick before reload
                 }
             }
@@ -627,6 +634,7 @@ void pc_hw_init(pc_hardware_t *hw, uint32_t cpu_freq_mhz) {
     // We'll tick PIT in batches to avoid overhead
     hw->cycles_per_pit_tick = (cpu_freq_mhz * 1000000) / PIT_CLOCK_FREQ;
     if (hw->cycles_per_pit_tick == 0) hw->cycles_per_pit_tick = 7; // ~8MHz default
+    hw->prev_pit0_output = true;  // PIT starts with output high in mode 3
 
     // Refresh LCD every ~33ms (30 fps) worth of instructions
     // At 8 MHz, that's ~264,000 instructions per frame
@@ -772,19 +780,30 @@ int pc_hw_tick(pc_hardware_t *hw, uint32_t cpu_cycles) {
         uint32_t pit_ticks = hw->pit_tick_accum / hw->cycles_per_pit_tick;
         hw->pit_tick_accum %= hw->cycles_per_pit_tick;
 
-        // Save old output states
         bool old_out0 = hw->pit.ch[0].output;
-        (void)old_out0;
 
         pit_tick(&hw->pit, pit_ticks);
 
         // PIT channel 0 output → IRQ 0 (timer)
         // Signal IRQ0 on rising edge of output
-        static bool prev_pit0_output = true;
-        if (hw->pit.ch[0].output && !prev_pit0_output) {
+        if (hw->pit.ch[0].output && !old_out0) {
             pic_signal_irq(&hw->pic_master, IRQ_TIMER);
         }
-        prev_pit0_output = hw->pit.ch[0].output;
+        hw->prev_pit0_output = hw->pit.ch[0].output;
+
+        // Diagnostic: log PIT/PIC state once
+        static bool pit_diag_done = false;
+        if (!pit_diag_done && hw->cpu_cycles > 100000) {
+            pit_diag_done = true;
+            ESP_LOGI(TAG, "PIT diag: loaded=%d gate=%d counter=%lu reload=%lu output=%d mode=%d",
+                     hw->pit.ch[0].loaded, hw->pit.ch[0].gate,
+                     (unsigned long)hw->pit.ch[0].counter,
+                     (unsigned long)hw->pit.ch[0].reload,
+                     hw->pit.ch[0].output, hw->pit.ch[0].mode);
+            ESP_LOGI(TAG, "PIC diag: IMR=%02X IRR=%02X ISR=%02X vec=%02X",
+                     hw->pic_master.IMR, hw->pic_master.IRR,
+                     hw->pic_master.ISR, hw->pic_master.vector_base);
+        }
     }
 
     // Check keyboard buffer → IRQ 1
@@ -1440,4 +1459,195 @@ void pc_hw_render_text(pc_hardware_t *hw, const uint8_t *video_mem) {
     }
 
     video_card_present();
+}
+
+// ============================================================================
+// CGA Graphics Mode Rendering
+// ============================================================================
+
+// CGA mode register bit definitions
+#define CGA_MODEREG_TEXT80      0x01  // 0 = 40-column text, 1 = 80-column text
+#define CGA_MODEREG_GRAPHICS   0x02  // 0 = text, 1 = graphics
+#define CGA_MODEREG_MONO       0x04  // 0 = color, 1 = monochrome
+#define CGA_MODEREG_ENABLED    0x08  // 0 = video off, 1 = video on
+#define CGA_MODEREG_GRAPH640   0x10  // 0 = 320x200, 1 = 640x200 (in graphics mode)
+#define CGA_MODEREG_BLINK      0x20  // 0 = bit7 = intense bg, 1 = bit7 = blink
+
+// CGA color register bit definitions
+#define CGA_COLORREG_BG_MASK   0x0F  // Background color (320x200) / foreground (640x200)
+#define CGA_COLORREG_INTENSE   0x10  // High-intensity palette
+#define CGA_COLORREG_PALETTE   0x20  // 0=green/red/brown, 1=cyan/magenta/white
+
+// CGA 4-color graphics palettes (indexed by palette_select * 2 + high_intensity)
+// palette_select=0: green, red, brown/yellow
+// palette_select=1: cyan, magenta, white
+static const uint16_t cga_gfx_palette[4][4] = {
+    // Palette 0, low intensity: bg, green, red, brown
+    { 0, 0x0540, 0xA800, 0xAAA0 },
+    // Palette 0, high intensity: bg, light green, light red, yellow
+    { 0, 0x57EA, 0xFAAA, 0xFFEA },
+    // Palette 1, low intensity: bg, cyan, magenta, light gray
+    { 0, 0x0555, 0xA815, 0xAD55 },
+    // Palette 1, high intensity: bg, light cyan, light magenta, white
+    { 0, 0x57FF, 0xFABF, 0xFFFF },
+};
+
+/**
+ * Render CGA 320x200x4 graphics mode to LCD framebuffer.
+ * CGA graphics memory layout:
+ *   Even scanlines (0,2,4,...): offset 0x0000 from video_mem
+ *   Odd scanlines  (1,3,5,...): offset 0x2000 from video_mem
+ * Each byte holds 4 pixels (2 bits each, MSB first).
+ *
+ * 320x200 scaled to 480x320:
+ *   X scale: 480/320 = 1.5x (each CGA pixel = 1 or 2 LCD pixels alternating)
+ *   Y scale: 320/200 = 1.6x (each CGA scanline = 1 or 2 LCD rows alternating)
+ */
+void pc_hw_render_320x200(pc_hardware_t *hw, const uint8_t *video_mem) {
+    if (!video_card_is_initialized()) return;
+    if (!hw->cga.needs_refresh) return;
+    hw->cga.needs_refresh = false;
+
+    uint16_t *fb = video_card_get_back_buffer();
+    if (!fb) return;
+
+    uint16_t fb_w = video_card_get_width();   // 480
+    uint16_t fb_h = video_card_get_height();  // 320
+
+    // Determine palette
+    int pal_idx = ((hw->cga.color_reg & CGA_COLORREG_PALETTE) ? 2 : 0)
+                + ((hw->cga.color_reg & CGA_COLORREG_INTENSE) ? 1 : 0);
+    uint16_t bg_color = cga_palette_rgb565[hw->cga.color_reg & CGA_COLORREG_BG_MASK];
+
+    // Build local palette with actual background color
+    uint16_t pal[4];
+    pal[0] = bg_color;
+    pal[1] = cga_gfx_palette[pal_idx][1];
+    pal[2] = cga_gfx_palette[pal_idx][2];
+    pal[3] = cga_gfx_palette[pal_idx][3];
+
+    // Render 200 CGA scanlines → 320 LCD rows
+    // Y mapping: for each CGA row y, LCD rows start at (y * 320 / 200) = (y * 8 / 5)
+    for (int cga_y = 0; cga_y < 200; cga_y++) {
+        // CGA memory: even lines at offset 0, odd lines at offset 0x2000
+        const uint8_t *src = video_mem + ((cga_y & 1) ? 0x2000 : 0x0000) + (cga_y >> 1) * 80;
+
+        // Calculate LCD Y start/end for this CGA scanline
+        int lcd_y0 = (cga_y * fb_h) / 200;
+        int lcd_y1 = ((cga_y + 1) * fb_h) / 200;
+        if (lcd_y1 > fb_h) lcd_y1 = fb_h;
+
+        // Render one LCD row, then duplicate for any extra rows
+        uint16_t *row = &fb[lcd_y0 * fb_w];
+
+        // Decode 80 bytes → 320 CGA pixels → 480 LCD pixels
+        int lcd_x = 0;
+        for (int byte_idx = 0; byte_idx < 80 && lcd_x < fb_w; byte_idx++) {
+            uint8_t b = src[byte_idx];
+            // 4 pixels per byte, 2 bits each (bits 7-6, 5-4, 3-2, 1-0)
+            for (int px = 0; px < 4 && lcd_x < fb_w; px++) {
+                int color_idx = (b >> (6 - px * 2)) & 0x03;
+                uint16_t c = pal[color_idx];
+                // X scaling: 320→480, ratio 3:2
+                // Every CGA pixel gets at least 1 LCD pixel, every other gets 2
+                int lcd_x1 = ((byte_idx * 4 + px + 1) * fb_w) / 320;
+                while (lcd_x < lcd_x1 && lcd_x < fb_w) {
+                    row[lcd_x++] = c;
+                }
+            }
+        }
+
+        // Duplicate this row for any additional LCD rows mapping to same CGA row
+        for (int y = lcd_y0 + 1; y < lcd_y1; y++) {
+            memcpy(&fb[y * fb_w], row, fb_w * sizeof(uint16_t));
+        }
+    }
+
+    video_card_present();
+}
+
+/**
+ * Render CGA 640x200x2 graphics mode to LCD framebuffer.
+ * CGA graphics memory layout: same interleaved as 320x200.
+ * Each byte holds 8 pixels (1 bit each, MSB first).
+ *
+ * 640x200 scaled to 480x320:
+ *   X scale: 480/640 = 0.75x (downsample)
+ *   Y scale: 320/200 = 1.6x  (upsample)
+ */
+void pc_hw_render_640x200(pc_hardware_t *hw, const uint8_t *video_mem) {
+    if (!video_card_is_initialized()) return;
+    if (!hw->cga.needs_refresh) return;
+    hw->cga.needs_refresh = false;
+
+    uint16_t *fb = video_card_get_back_buffer();
+    if (!fb) return;
+
+    uint16_t fb_w = video_card_get_width();   // 480
+    uint16_t fb_h = video_card_get_height();  // 320
+
+    // Foreground color from color register
+    uint16_t fg = cga_palette_rgb565[hw->cga.color_reg & CGA_COLORREG_BG_MASK];
+    uint16_t bg = 0x0000;  // Black background
+
+    // Render 200 CGA scanlines → 320 LCD rows
+    for (int cga_y = 0; cga_y < 200; cga_y++) {
+        const uint8_t *src = video_mem + ((cga_y & 1) ? 0x2000 : 0x0000) + (cga_y >> 1) * 80;
+
+        int lcd_y0 = (cga_y * fb_h) / 200;
+        int lcd_y1 = ((cga_y + 1) * fb_h) / 200;
+        if (lcd_y1 > fb_h) lcd_y1 = fb_h;
+
+        uint16_t *row = &fb[lcd_y0 * fb_w];
+
+        // Decode 80 bytes → 640 CGA pixels → 480 LCD pixels (3:4 downscale)
+        int lcd_x = 0;
+        for (int byte_idx = 0; byte_idx < 80 && lcd_x < fb_w; byte_idx++) {
+            uint8_t b = src[byte_idx];
+            for (int px = 0; px < 8 && lcd_x < fb_w; px++) {
+                bool pixel = (b >> (7 - px)) & 1;
+                uint16_t c = pixel ? fg : bg;
+                int cga_pixel = byte_idx * 8 + px;
+                int lcd_x1 = ((cga_pixel + 1) * fb_w) / 640;
+                while (lcd_x < lcd_x1 && lcd_x < fb_w) {
+                    row[lcd_x++] = c;
+                }
+            }
+        }
+
+        // Duplicate row for Y scaling
+        for (int y = lcd_y0 + 1; y < lcd_y1; y++) {
+            memcpy(&fb[y * fb_w], row, fb_w * sizeof(uint16_t));
+        }
+    }
+
+    video_card_present();
+}
+
+/**
+ * Render CGA video - auto-detect mode from mode register.
+ * Call this instead of pc_hw_render_text() when mode may be graphics.
+ *
+ * @param hw      PC hardware state (contains cga mode/color regs)
+ * @param video_mem Pointer to start of video memory (0xB8000)
+ */
+void pc_hw_render_cga(pc_hardware_t *hw, const uint8_t *video_mem) {
+    uint8_t mode = hw->cga.mode_reg;
+
+    if (!(mode & CGA_MODEREG_ENABLED)) {
+        return;  // Video disabled
+    }
+
+    if (mode & CGA_MODEREG_GRAPHICS) {
+        if (mode & CGA_MODEREG_GRAPH640) {
+            // 640x200 2-color graphics
+            pc_hw_render_640x200(hw, video_mem);
+        } else {
+            // 320x200 4-color graphics
+            pc_hw_render_320x200(hw, video_mem);
+        }
+    } else {
+        // Text mode (40x25 or 80x25)
+        pc_hw_render_text(hw, video_mem);
+    }
 }

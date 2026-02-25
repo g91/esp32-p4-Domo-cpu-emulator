@@ -374,7 +374,7 @@ esp_err_t lcd_console_init(void)
     ESP_LOGI(TAG, "Creating ST7796S panel...");
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_PIN_NUM_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,  // ST7796S typically uses BGR
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,  // Standard RGB565 data format
         .bits_per_pixel = LCD_BIT_PER_PIXEL,
     };
     ret = esp_lcd_new_panel_st7789(console->io_handle, &panel_config, &console->panel_handle);
@@ -805,14 +805,23 @@ void lcd_console_get_pins(int *rst_pin, int *bl_pin, int *mosi_pin, int *clk_pin
     if (clk_pin) *clk_pin = LCD_PIN_NUM_CLK;
 }
 
-void lcd_console_draw_raw(int x_start, int y_start, int x_end, int y_end,
-                          const void *data)
+esp_err_t lcd_console_draw_raw(int x_start, int y_start, int x_end, int y_end,
+                               const void *data)
 {
     if (!console || !console->initialized || !console->panel_handle || !data) {
-        return;
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Acquire SPI mutex to prevent concurrent access from other tasks
+    // (e.g., lcd_console_print during boot vs video_refresh_task in GFX mode)
+    if (console->mutex) {
+        xSemaphoreTake(console->mutex, portMAX_DELAY);
     }
     // Draw raw RGB565 data directly to LCD panel
     // Data is assumed to already be in DMA-capable memory
-    esp_lcd_panel_draw_bitmap(console->panel_handle, x_start, y_start,
-                              x_end, y_end, data);
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(console->panel_handle, x_start, y_start,
+                                               x_end, y_end, data);
+    if (console->mutex) {
+        xSemaphoreGive(console->mutex);
+    }
+    return ret;
 }

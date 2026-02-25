@@ -90,7 +90,7 @@ typedef struct {
     uint8_t  mode;          // Operating mode (0-5)
     uint8_t  bcd;           // BCD mode
     uint8_t  rw_mode;       // Read/write mode
-    uint8_t  latch;         // Latched value
+    uint16_t latch;         // Latched value (16-bit counter snapshot)
     bool     latched;       // Value is latched
     bool     gate;          // Gate input
     bool     output;        // Output state
@@ -210,6 +210,7 @@ typedef struct {
     uint32_t    cpu_cycles;         // Cycle counter for PIT ticking
     uint32_t    cycles_per_pit_tick;// CPU cycles between PIT ticks
     uint32_t    pit_tick_accum;     // Accumulator for PIT ticks
+    bool        prev_pit0_output;   // Previous PIT ch0 output for edge detection
 
     // Video refresh
     uint32_t    refresh_counter;    // Count instructions between LCD refreshes
@@ -245,6 +246,24 @@ int pc_hw_tick(pc_hardware_t *hw, uint32_t cpu_cycles);
  * @param video_mem Pointer to video memory (0xB8000)
  */
 void pc_hw_render_text(pc_hardware_t *hw, const uint8_t *video_mem);
+
+/**
+ * Render CGA 320x200x4 color graphics mode to LCD
+ * @param video_mem Pointer to CGA video memory (0xB8000)
+ */
+void pc_hw_render_320x200(pc_hardware_t *hw, const uint8_t *video_mem);
+
+/**
+ * Render CGA 640x200x2 color graphics mode to LCD
+ * @param video_mem Pointer to CGA video memory (0xB8000)
+ */
+void pc_hw_render_640x200(pc_hardware_t *hw, const uint8_t *video_mem);
+
+/**
+ * Auto-detect CGA mode and render appropriately (text or graphics)
+ * @param video_mem Pointer to CGA video memory (0xB8000)
+ */
+void pc_hw_render_cga(pc_hardware_t *hw, const uint8_t *video_mem);
 
 #ifdef __cplusplus
 }

@@ -5,7 +5,9 @@
  */
 
 #include "usb_keyboard.h"
+#include "ps2_keyboard.h"   // Shared key defines (PS2_KEY_F1, PS2_KEY_UP, etc.)
 #include "usb_mouse.h"
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -24,16 +26,25 @@ static QueueHandle_t key_queue = NULL;
 static hid_host_device_handle_t kbd_handle = NULL;
 static hid_host_device_handle_t mouse_handle = NULL;
 
-// USB HID keycodes to ASCII translation table
+// USB HID keycodes to ASCII/special key translation table
+// Uses PS2_KEY_* defines from ps2_keyboard.h for function/special keys
+// so all keyboard drivers produce the same key codes
 static const uint8_t hid_to_ascii[] = {
     0,   0,   0,   0,   'a', 'b', 'c', 'd', // 0x00-0x07
     'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', // 0x08-0x0F
     'm', 'n', 'o', 'p', 'q', 'r', 's', 't', // 0x10-0x17
     'u', 'v', 'w', 'x', 'y', 'z', '1', '2', // 0x18-0x1F
     '3', '4', '5', '6', '7', '8', '9', '0', // 0x20-0x27
-    '\n','\b', 0x1B, '\t',' ', '-', '=', '[', // 0x28-0x2F (Enter, Backspace, Esc, Tab, Space)
+    '\r',PS2_KEY_ESCAPE, PS2_KEY_BACKSPACE, '\t',' ', '-', '=', '[', // 0x28-0x2F
     ']', '\\', '#', ';', '\'','`', ',', '.', // 0x30-0x37
-    '/', 0,   0,   0,   0,   0,   0,   0,   // 0x38-0x3F
+    '/', 0,                                   // 0x38-0x39 (CapsLock)
+    PS2_KEY_F1,  PS2_KEY_F2,  PS2_KEY_F3,  PS2_KEY_F4,   // 0x3A-0x3D
+    PS2_KEY_F5,  PS2_KEY_F6,  PS2_KEY_F7,  PS2_KEY_F8,   // 0x3E-0x41
+    PS2_KEY_F9,  PS2_KEY_F10, PS2_KEY_F11, PS2_KEY_F12,  // 0x42-0x45
+    0,   0,   0,                              // 0x46-0x48 (PrtSc, ScrLk, Pause)
+    PS2_KEY_INSERT, PS2_KEY_HOME, PS2_KEY_PAGEUP,         // 0x49-0x4B
+    PS2_KEY_DELETE, PS2_KEY_END,  PS2_KEY_PAGEDOWN,       // 0x4C-0x4E
+    PS2_KEY_RIGHT,  PS2_KEY_LEFT, PS2_KEY_DOWN, PS2_KEY_UP, // 0x4F-0x52
 };
 
 // Shift key translations
@@ -43,10 +54,32 @@ static const uint8_t hid_to_ascii_shift[] = {
     'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', // 0x10-0x17
     'U', 'V', 'W', 'X', 'Y', 'Z', '!', '@', // 0x18-0x1F
     '#', '$', '%', '^', '&', '*', '(', ')', // 0x20-0x27
-    '\n','\b', 0x1B, '\t',' ', '_', '+', '{', // 0x28-0x2F
+    '\r',PS2_KEY_ESCAPE, PS2_KEY_BACKSPACE, '\t',' ', '_', '+', '{', // 0x28-0x2F
     '}', '|', '~', ':', '"', '~', '<', '>', // 0x30-0x37
-    '?', 0,   0,   0,   0,   0,   0,   0,   // 0x38-0x3F
+    '?', 0,                                   // 0x38-0x39 (CapsLock)
+    PS2_KEY_F1,  PS2_KEY_F2,  PS2_KEY_F3,  PS2_KEY_F4,   // 0x3A-0x3D
+    PS2_KEY_F5,  PS2_KEY_F6,  PS2_KEY_F7,  PS2_KEY_F8,   // 0x3E-0x41
+    PS2_KEY_F9,  PS2_KEY_F10, PS2_KEY_F11, PS2_KEY_F12,  // 0x42-0x45
+    0,   0,   0,                              // 0x46-0x48 (PrtSc, ScrLk, Pause)
+    PS2_KEY_INSERT, PS2_KEY_HOME, PS2_KEY_PAGEUP,         // 0x49-0x4B
+    PS2_KEY_DELETE, PS2_KEY_END,  PS2_KEY_PAGEDOWN,       // 0x4C-0x4E
+    PS2_KEY_RIGHT,  PS2_KEY_LEFT, PS2_KEY_DOWN, PS2_KEY_UP, // 0x4F-0x52
 };
+
+// Previous HID report state for key-change detection
+// USB keyboards send all currently-pressed keys in every report.
+// Without tracking, held keys get re-enqueued every report cycle (~8ms),
+// flooding the queue and drowning out new keypresses.
+static uint8_t prev_keys[6] = {0};
+static uint8_t prev_modifier = 0;
+
+// Check if a keycode was already pressed in the previous report
+static bool was_key_pressed(uint8_t keycode) {
+    for (int i = 0; i < 6; i++) {
+        if (prev_keys[i] == keycode) return true;
+    }
+    return false;
+}
 
 // HID interface callback - handles keyboard input reports
 static void hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
@@ -72,21 +105,32 @@ static void hid_host_interface_callback(hid_host_device_handle_t hid_device_hand
             uint8_t modifier = data[0];
             bool shift = (modifier & 0x22) != 0; // Left or Right Shift
             
-            // Process pressed keys
+            // Only process NEWLY pressed keys (not held from previous report)
             for (int i = 2; i < 8; i++) {
                 uint8_t keycode = data[i];
                 if (keycode == 0) break;
+                if (keycode == 1) continue;  // Error rollover
                 
-                // Convert HID keycode to ASCII
+                // Skip keys that were already pressed in the previous report
+                if (was_key_pressed(keycode)) continue;
+                
+                // This is a NEW keypress - convert and enqueue
                 uint8_t ascii = 0;
                 if (keycode < sizeof(hid_to_ascii)) {
                     ascii = shift ? hid_to_ascii_shift[keycode] : hid_to_ascii[keycode];
                 }
                 
+                // Debug: log keycode and resulting ASCII
+                ESP_LOGI(TAG, "HID key 0x%02X -> ASCII 0x%02X ('%c')", keycode, ascii, (ascii >= 0x20 && ascii < 0x7F) ? ascii : '?');
+                
                 if (ascii != 0 && key_queue != NULL) {
                     xQueueSend(key_queue, &ascii, 0);
                 }
             }
+            
+            // Save current report as previous for next comparison
+            memcpy(prev_keys, &data[2], 6);
+            prev_modifier = modifier;
         }
         break;
         

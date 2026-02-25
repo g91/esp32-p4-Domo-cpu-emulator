@@ -31,6 +31,8 @@
 #include "m68k_emulator.h"
 #include "i8086_emulator.h"
 #include "mos6502_emulator.h"
+#include "apple2e_emulator.h"
+#include "z80_emulator.h"
 #include "video_card.h"
 #include "disk_image.h"
 #include "lcd_console.h"
@@ -53,7 +55,10 @@
 #include "amiga.h"
 #include "wifi_ftp_server.h"
 #include "ssh_debug_server.h"
+#include "ethernet_init.h"
+#include "esp_eth.h"
 #include <ctype.h>
+#include "esp32_os.h"
 
 static const char* TAG = "m68k_app";
 
@@ -62,10 +67,19 @@ static bool wifi_initialized = false;
 static bool wifi_connected = false;
 static char connected_ssid[32] = {0};
 static esp_netif_ip_info_t ip_info = {0};
+static int s_wifi_retry_num = 0;
+#define WIFI_MAX_RETRY 10
+
+// Ethernet state
+static bool ethernet_initialized = false;
 
 // Bluetooth state for ESP32-C6 SDIO communication
 static bool bt_initialized = false;
 static bool bt_scanning = false;
+
+// ESP32 Native OS (Windows 3.1-style desktop)
+static TaskHandle_t s_esp32os_task_handle = NULL;
+static void esp32os_run_task(void *arg);
 
 // i386 PC emulator (uses tiny386 engine via pc_emulator module)
 static TaskHandle_t s_i86_task_handle = NULL;
@@ -97,12 +111,29 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_connected = false;
         memset(connected_ssid, 0, sizeof(connected_ssid));
-        ftp_server_stop();
-        ESP_LOGI(TAG, "WiFi disconnected, FTP server stopped");
+        // Auto-reconnect with retry limit
+        if (s_wifi_retry_num < WIFI_MAX_RETRY) {
+            s_wifi_retry_num++;
+            ESP_LOGI(TAG, "WiFi disconnected, retrying (%d/%d)...", s_wifi_retry_num, WIFI_MAX_RETRY);
+            vTaskDelay(pdMS_TO_TICKS(1000 * s_wifi_retry_num));  // Exponential backoff
+            esp_wifi_connect();
+        } else {
+            ftp_server_stop();
+            ESP_LOGW(TAG, "WiFi disconnected after %d retries - use 'connect' to retry", WIFI_MAX_RETRY);
+            s_wifi_retry_num = 0;  // Reset for manual retry
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ip_info = event->ip_info;
         wifi_connected = true;
+        s_wifi_retry_num = 0;  // Reset retry counter on successful connection
+        
+        // Save connected SSID
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            strlcpy(connected_ssid, (char*)ap.ssid, sizeof(connected_ssid));
+        }
+        
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         
         // Start FTP server automatically when WiFi connects
@@ -120,6 +151,37 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "Use 'crash' and 'dump' commands for M68K debugging");
         } else {
             ESP_LOGE(TAG, "Failed to start telnet server: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
+// Ethernet event handler - auto-start services when Ethernet gets IP
+static void eth_event_handler_main(void* arg, esp_event_base_t event_base,
+                                   int32_t event_id, void* event_data) {
+    if (event_base == ETH_EVENT) {
+        if (event_id == ETHERNET_EVENT_CONNECTED) {
+            ESP_LOGI(TAG, "Ethernet cable connected");
+        } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
+            ESP_LOGW(TAG, "Ethernet cable disconnected");
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Ethernet got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        // Auto-start FTP server if not already running
+        if (!ftp_server_is_running()) {
+            esp_err_t ret = ftp_server_init();
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "FTP server started via Ethernet at ftp://" IPSTR ":21", 
+                         IP2STR(&event->ip_info.ip));
+            }
+        }
+        
+        // Auto-start telnet server
+        esp_err_t ret = ssh_debug_server_init();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Telnet debug console via Ethernet: telnet " IPSTR " 23", 
+                     IP2STR(&event->ip_info.ip));
         }
     }
 }
@@ -192,7 +254,10 @@ static bool lcd_console_active = false;
 typedef enum {
     ACTIVE_CPU_M68K,
     ACTIVE_CPU_I8086,
-    ACTIVE_CPU_6502
+    ACTIVE_CPU_6502,
+    ACTIVE_CPU_APPLE2E,
+    ACTIVE_CPU_C128,
+    ACTIVE_CPU_Z80      /* Z80 CP/M 2.2 */
 } active_cpu_t;
 
 static active_cpu_t active_cpu = ACTIVE_CPU_M68K;
@@ -549,6 +614,9 @@ static void m68k_os_task(void *arg) {
 static TaskHandle_t s_6502_task_handle = NULL;
 static void mos6502_run_task(void *arg);
 
+static TaskHandle_t s_apple2e_task_handle = NULL;
+static void apple2e_run_task(void *arg);
+
 // Try to auto-boot OS.bin from SD card root
 // Returns true if OS was loaded and started, false otherwise
 static bool try_autoboot(void) {
@@ -601,6 +669,29 @@ static bool try_autoboot(void) {
     struct stat st_vic20;
     if (stat("/sdcard/vic20/kernal.rom", &st_vic20) == 0) {
         vic20_roms_found = true;
+    }
+
+    // Check for C128 ROMs (need at least kernal.rom)
+    bool c128_roms_found = false;
+    struct stat st_c128;
+    if (stat("/sdcard/c128/kernal.rom", &st_c128) == 0) {
+        c128_roms_found = true;
+    }
+
+    // Check for Apple IIe ROMs
+    bool apple2e_roms_found = false;
+    const char *apple2e_rom_paths[] = {
+        "/sdcard/apple2e/apple2e_enhanced.rom",
+        "/sdcard/apple2e/apple2e.rom",
+        "/sdcard/apple2e/APPLE2E.ROM",
+        NULL
+    };
+    for (int i = 0; apple2e_rom_paths[i] != NULL; i++) {
+        struct stat st_a2;
+        if (stat(apple2e_rom_paths[i], &st_a2) == 0) {
+            apple2e_roms_found = true;
+            break;
+        }
     }
 
     // Check for Atari ST TOS ROM
@@ -688,7 +779,7 @@ static bool try_autoboot(void) {
     }
 
     // If nothing bootable exists, skip boot menu
-    if (!os_exists && !i86_disk_found && !mos6502_prog_found && !c64_roms_found && !vic20_roms_found && !atari_tos_found && !amiga_kick_found) {
+    if (!os_exists && !i86_disk_found && !mos6502_prog_found && !c64_roms_found && !vic20_roms_found && !atari_tos_found && !amiga_kick_found && !c128_roms_found && !apple2e_roms_found) {
         return false;
     }
     
@@ -734,8 +825,20 @@ static bool try_autoboot(void) {
     } else {
         printf("  [8] Boot Amiga (ROM needed in /sdcard/amiga/)\n");
     }
+    if (c128_roms_found) {
+        printf("  [9] Boot Commodore 128 (C128 emulation)\n");
+    } else {
+        printf("  [9] Boot C128 (ROMs needed in /sdcard/c128/)\n");
+    }
+    if (apple2e_roms_found) {
+        printf("  [0] Boot Apple IIe (Apple II emulation)\n");
+    } else {
+        printf("  [0] Boot Apple IIe (ROM needed in /sdcard/apple2e/)\n");
+    }
+    printf("  [Z] Boot CP/M 2.2 (Z80 emulator, disks in /sdcard/cpm/)\n");
+    printf("  [W] Boot ESP32 Native OS (Windows 3.1 desktop, mouse+keyboard)\n");
     printf("\n");
-    printf("Select option (1-8): ");
+    printf("Select option (0-9, Z, W): ");
     
     // Show boot menu on display - use video card if active, otherwise lcd_console
     if (video_card_is_initialized()) {
@@ -750,7 +853,11 @@ static bool try_autoboot(void) {
         if (vic20_roms_found) video_card_print("[6] VIC-20\n");
         if (atari_tos_found) video_card_print("[7] Atari ST\n");
         if (amiga_kick_found) video_card_print("[8] Amiga\n");
-        video_card_print("\nSelect 1-8...\n");
+        if (c128_roms_found) video_card_print("[9] C128\n");
+        if (apple2e_roms_found) video_card_print("[0] Apple IIe\n");
+        video_card_print("[Z] CP/M 2.2\n");
+        video_card_print("[W] ESP32 Native OS\n");
+        video_card_print("\nSelect 0-9, Z, W...\n");
     } else if (lcd_console_is_initialized()) {
         lcd_console_clear();
         lcd_console_print("SYSTEM BOOT MENU\n");
@@ -775,7 +882,15 @@ static bool try_autoboot(void) {
         if (amiga_kick_found) {
             lcd_console_print("[8] Amiga\n");
         }
-        lcd_console_print("\nSelect 1-8...\n");
+        if (c128_roms_found) {
+            lcd_console_print("[9] C128\n");
+        }
+        if (apple2e_roms_found) {
+            lcd_console_print("[0] Apple IIe\n");
+        }
+        lcd_console_print("[Z] CP/M 2.2\n");
+        lcd_console_print("[W] ESP32 Native OS\n");
+        lcd_console_print("\nSelect 0-9, Z, W...\n");
     }
     
     // Wait for user selection with 5-second timeout (default to BIOS if no input)
@@ -810,6 +925,18 @@ static bool try_autoboot(void) {
                 } else if (key == '8') {
                     selection = 8;
                     printf("8\n");
+                } else if (key == '9') {
+                    selection = 9;
+                    printf("9\n");
+                } else if (key == '0') {
+                    selection = 10;
+                    printf("0\n");
+                } else if (key == 'z' || key == 'Z') {
+                    selection = 11;
+                    printf("Z\n");
+                } else if (key == 'w' || key == 'W') {
+                    selection = 12;
+                    printf("W\n");
                 }
             }
         }
@@ -825,6 +952,10 @@ static bool try_autoboot(void) {
             else if (key == '6') { selection = 6; printf("6\n"); }
             else if (key == '7') { selection = 7; printf("7\n"); }
             else if (key == '8') { selection = 8; printf("8\n"); }
+            else if (key == '9') { selection = 9; printf("9\n"); }
+            else if (key == '0') { selection = 10; printf("0\n"); }
+            else if (key == 'z' || key == 'Z') { selection = 11; printf("Z\n"); }
+            else if (key == 'w' || key == 'W') { selection = 12; printf("W\n"); }
         }
 
         // Check UART/USB Serial input (non-blocking)
@@ -855,9 +986,21 @@ static bool try_autoboot(void) {
             } else if (uart_data == '8') {
                 selection = 8;
                 printf("8\n");
+            } else if (uart_data == '9') {
+                selection = 9;
+                printf("9\n");
+            } else if (uart_data == '0') {
+                selection = 10;
+                printf("0\n");
+            } else if (uart_data == 'z' || uart_data == 'Z') {
+                selection = 11;
+                printf("Z\n");
+            } else if (uart_data == 'w' || uart_data == 'W') {
+                selection = 12;
+                printf("W\n");
             }
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(50));
         timeout_count++;
     }
@@ -1135,6 +1278,180 @@ static bool try_autoboot(void) {
             amiga_destroy();
             return false;
         }
+    }
+
+    // ---- C128 boot handler ----
+    if (selection == 9) {
+        printf("\nBooting Commodore 128...\n\n");
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("Booting C128...\n\n");
+        } else if (lcd_console_is_initialized()) {
+            lcd_console_clear();
+            lcd_console_print("Booting C128...\n\n");
+        }
+
+        if (!video_card_is_initialized()) {
+            esp_err_t vid_ret = video_card_init();
+            if (vid_ret != ESP_OK) {
+                printf("Warning: Video card init failed: %s\n", esp_err_to_name(vid_ret));
+            }
+        }
+
+        esp_err_t ret = mos6502_emu_init_mode(MOS6502_MODE_C128);
+        if (ret != ESP_OK) {
+            printf("Failed to init C128: %s\n", esp_err_to_name(ret));
+            return false;
+        }
+
+        ret = mos6502_emu_load_roms();
+        if (ret != ESP_OK) {
+            printf("Warning: C128 ROM loading had issues\n");
+        }
+
+        mos6502_emu_reset();
+        active_cpu = ACTIVE_CPU_C128;
+
+        if (s_6502_task_handle == NULL) {
+            BaseType_t task_ret = xTaskCreate(mos6502_run_task, "c128_run", 8192, NULL, 5, &s_6502_task_handle);
+            if (task_ret == pdPASS) {
+                printf("Commodore 128 running. Use 'stop6502' to halt.\n\n");
+                while (s_6502_task_handle != NULL) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+                return false;
+            } else {
+                printf("Failed to start C128 task\n");
+            }
+        }
+        return false;
+    }
+
+    // ---- Apple IIe boot handler ----
+    if (selection == 10) {
+        printf("\nBooting Apple IIe...\n\n");
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("Booting Apple IIe...\n\n");
+        } else if (lcd_console_is_initialized()) {
+            lcd_console_clear();
+            lcd_console_print("Booting Apple IIe...\n\n");
+        }
+
+        if (!video_card_is_initialized()) {
+            esp_err_t vid_ret = video_card_init();
+            if (vid_ret != ESP_OK) {
+                printf("Warning: Video card init failed: %s\n", esp_err_to_name(vid_ret));
+            }
+        }
+
+        esp_err_t ret = apple2e_init();
+        if (ret != ESP_OK) {
+            printf("Failed to init Apple IIe: %s\n", esp_err_to_name(ret));
+            return false;
+        }
+
+        ret = apple2e_load_roms();
+        if (ret != ESP_OK) {
+            printf("Warning: Apple IIe ROM loading had issues\n");
+        }
+
+        apple2e_reset();
+        active_cpu = ACTIVE_CPU_APPLE2E;
+
+        if (s_apple2e_task_handle == NULL) {
+            BaseType_t task_ret = xTaskCreate(apple2e_run_task, "apple2e", 8192, NULL, 5, &s_apple2e_task_handle);
+            if (task_ret == pdPASS) {
+                printf("Apple IIe running. Press Ctrl+C to exit.\n\n");
+                while (s_apple2e_task_handle != NULL) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+                return false;
+            } else {
+                printf("Failed to start Apple IIe task\n");
+            }
+        }
+        return false;
+    }
+
+    // ---- CP/M 2.2 / Z80 boot handler ----
+    if (selection == 11) {
+        printf("\nBooting CP/M 2.2 (Z80)...\n\n");
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("Booting CP/M 2.2...\n\n");
+        } else if (lcd_console_is_initialized()) {
+            lcd_console_clear();
+            lcd_console_print("Booting CP/M 2.2\n");
+            lcd_console_print("Z80 @ 4 MHz\n\n");
+        }
+
+        z80_emu_config_t cpm_config = {
+            .disk_dir    = "/sdcard/cpm",
+            .prog_path   = NULL,
+            .enable_lcd  = true,
+            .cpu_freq_hz = 4000000,
+        };
+
+        esp_err_t ret = z80_emu_init(&cpm_config);
+        if (ret != ESP_OK) {
+            printf("Failed to init CP/M: %s\n", esp_err_to_name(ret));
+            return false;
+        }
+
+        /* Try to auto-load a .COM file if found in /sdcard/cpm/a/ */
+        const char *autorun_path = "/sdcard/cpm/a/cpm22.com";
+        struct stat autorun_st;
+        if (stat(autorun_path, &autorun_st) == 0) {
+            z80_emu_load_com(autorun_path);
+        }
+
+        active_cpu = ACTIVE_CPU_Z80;
+
+        /* Run inline (blocks until CP/M exits or user presses Ctrl+C) */
+        z80_emu_run();
+
+        z80_emu_deinit();
+        active_cpu = ACTIVE_CPU_M68K;
+        return false;  /* Return to BIOS shell */
+    }
+
+    // ---- ESP32 Native OS (Windows 3.1-style desktop) ----
+    if (selection == 12) {
+        printf("\nBooting ESP32 Native OS...\n\n");
+        if (video_card_is_initialized()) {
+            video_card_text_clear();
+            video_card_print("ESP32 Native OS\n");
+            video_card_print("Windows 3.1 Desktop\n");
+            video_card_print("Starting...\n");
+        } else if (lcd_console_is_initialized()) {
+            lcd_console_clear();
+            lcd_console_print("ESP32 Native OS\n");
+            lcd_console_print("Starting...\n");
+        }
+
+        // Ensure GPU video card is initialized
+        if (!video_card_is_initialized()) {
+            esp_err_t vid_ret = video_card_init();
+            if (vid_ret != ESP_OK) {
+                printf("Warning: Video card init failed: %s\n", esp_err_to_name(vid_ret));
+            }
+        }
+
+        if (s_esp32os_task_handle == NULL) {
+            BaseType_t task_ret = xTaskCreate(esp32os_run_task, "esp32os", 16384,
+                                              NULL, 5, &s_esp32os_task_handle);
+            if (task_ret == pdPASS) {
+                printf("ESP32 Native OS running. Press ESC to exit.\n\n");
+                while (s_esp32os_task_handle != NULL) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+                return false;
+            } else {
+                printf("Failed to start ESP32 OS task\n");
+            }
+        }
+        return false;
     }
 
     if (selection != 1 || !os_exists) {
@@ -2598,6 +2915,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
     const char *password = argv[2];
     
     console_printf("Connecting to '%s'...\n", ssid);
+    s_wifi_retry_num = 0;  // Reset retry counter for manual connect
     
     // Configure WiFi station
     wifi_config_t wifi_config = {0};
@@ -2653,6 +2971,23 @@ static int cmd_wifi_status(int argc, char **argv) {
         console_printf("WiFi Status: Unknown (error: %s)\n", esp_err_to_name(ret));
     }
     
+    // Also show Ethernet status
+    if (ethernet_initialized) {
+        if (ethernet_is_link_up()) {
+            console_printf("Ethernet: ✓ Link Up\n");
+            if (ethernet_is_connected()) {
+                char eth_ip[16];
+                if (ethernet_get_ip(eth_ip, sizeof(eth_ip)) == ESP_OK) {
+                    console_printf("  IP address: %s\n", eth_ip);
+                }
+            } else {
+                console_printf("  IP: Waiting for DHCP...\n");
+            }
+        } else {
+            console_printf("Ethernet: ✗ Link Down (no cable)\n");
+        }
+    }
+    
     return 0;
 }
 
@@ -2670,47 +3005,88 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
 }
 
 static int cmd_ipconfig(int argc, char **argv) {
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (!netif) {
-        console_printf("Network interface not found\n");
-        return 1;
-    }
+    console_printf("\n=== Network Configuration ===\n\n");
     
-    // Get MAC address
-    uint8_t mac[6];
-    esp_err_t ret = esp_netif_get_mac(netif, mac);
-    if (ret == ESP_OK) {
-        console_printf("MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    }
-    
-    // Get IP info
-    esp_netif_ip_info_t ip_info;
-    ret = esp_netif_get_ip_info(netif, &ip_info);
-    if (ret == ESP_OK) {
-        console_printf("IP Address: " IPSTR "\n", IP2STR(&ip_info.ip));
-        console_printf("Netmask:    " IPSTR "\n", IP2STR(&ip_info.netmask));
-        console_printf("Gateway:    " IPSTR "\n", IP2STR(&ip_info.gw));
+    // --- WiFi Interface ---
+    console_printf("--- WiFi (ESP32-C6 SDIO) ---\n");
+    esp_netif_t *wifi_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (wifi_netif) {
+        uint8_t mac[6];
+        if (esp_netif_get_mac(wifi_netif, mac) == ESP_OK) {
+            console_printf("  MAC:     %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+        
+        wifi_ap_record_t ap_info;
+        esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
+        if (ret == ESP_OK) {
+            console_printf("  Status:  ✓ Connected to '%s'\n", ap_info.ssid);
+            console_printf("  Signal:  %d dBm (Ch %d)\n", ap_info.rssi, ap_info.primary);
+            
+            esp_netif_ip_info_t wifi_ip;
+            if (esp_netif_get_ip_info(wifi_netif, &wifi_ip) == ESP_OK && wifi_ip.ip.addr != 0) {
+                console_printf("  IP:      " IPSTR "\n", IP2STR(&wifi_ip.ip));
+                console_printf("  Netmask: " IPSTR "\n", IP2STR(&wifi_ip.netmask));
+                console_printf("  Gateway: " IPSTR "\n", IP2STR(&wifi_ip.gw));
+            } else {
+                console_printf("  IP:      Waiting for DHCP...\n");
+            }
+        } else {
+            console_printf("  Status:  ✗ Disconnected\n");
+        }
     } else {
-        console_printf("No IP address assigned (not connected)\n");
+        console_printf("  Status:  Not initialized\n");
     }
     
-    // Get WiFi connection status
-    wifi_ap_record_t ap_info;
-    ret = esp_wifi_sta_get_ap_info(&ap_info);
-    if (ret == ESP_OK) {
-        console_printf("Connected to: %s (RSSI: %d dBm, Ch: %d)\n", 
-            ap_info.ssid, ap_info.rssi, ap_info.primary);
+    // --- Ethernet Interface ---
+    console_printf("\n--- Ethernet (RJ45 100M) ---\n");
+    if (ethernet_initialized) {
+        esp_netif_t *eth_netif = ethernet_get_netif();
+        if (eth_netif) {
+            uint8_t mac[6];
+            if (esp_netif_get_mac(eth_netif, mac) == ESP_OK) {
+                console_printf("  MAC:     %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            }
+            
+            if (ethernet_is_link_up()) {
+                console_printf("  Link:    ✓ Up\n");
+                if (ethernet_is_connected()) {
+                    esp_netif_ip_info_t eth_ip;
+                    if (esp_netif_get_ip_info(eth_netif, &eth_ip) == ESP_OK && eth_ip.ip.addr != 0) {
+                        console_printf("  IP:      " IPSTR "\n", IP2STR(&eth_ip.ip));
+                        console_printf("  Netmask: " IPSTR "\n", IP2STR(&eth_ip.netmask));
+                        console_printf("  Gateway: " IPSTR "\n", IP2STR(&eth_ip.gw));
+                    }
+                } else {
+                    console_printf("  IP:      Waiting for DHCP...\n");
+                }
+            } else {
+                console_printf("  Link:    ✗ Down (no cable?)\n");
+            }
+        }
     } else {
-        console_printf("WiFi: Not connected\n");
+        console_printf("  Status:  Not initialized\n");
     }
     
-    // FTP server status
+    // --- Services ---
+    console_printf("\n--- Services ---\n");
     if (ftp_server_is_running()) {
-        console_printf("FTP Server: Running at ftp://" IPSTR ":21\n", IP2STR(&ip_info.ip));
+        // Show FTP on whichever interface has IP
+        char ftp_ip[16] = "0.0.0.0";
+        if (wifi_connected) {
+            esp_netif_ip_info_t wifi_ip;
+            if (wifi_netif && esp_netif_get_ip_info(wifi_netif, &wifi_ip) == ESP_OK) {
+                snprintf(ftp_ip, sizeof(ftp_ip), IPSTR, IP2STR(&wifi_ip.ip));
+            }
+        } else if (ethernet_is_connected()) {
+            ethernet_get_ip(ftp_ip, sizeof(ftp_ip));
+        }
+        console_printf("  FTP:     Running at ftp://%s:21\n", ftp_ip);
     } else {
-        console_printf("FTP Server: Not running\n");
+        console_printf("  FTP:     Not running\n");
     }
+    console_printf("\n");
     
     return 0;
 }
@@ -3060,8 +3436,11 @@ static int cmd_switch(int argc, char **argv) {
         const char *name = "M68K";
         if (active_cpu == ACTIVE_CPU_I8086) name = "i8086";
         else if (active_cpu == ACTIVE_CPU_6502) name = "6502";
+        else if (active_cpu == ACTIVE_CPU_APPLE2E) name = "Apple IIe";
+        else if (active_cpu == ACTIVE_CPU_C128) name = "C128";
+        else if (active_cpu == ACTIVE_CPU_Z80) name = "Z80 CP/M";
         console_printf("Current CPU: %s\n", name);
-        console_printf("Usage: switch <m68k|i8086|6502>\n");
+        console_printf("Usage: switch <m68k|i8086|6502|apple2e|c128|z80>\n");
         return 0;
     }
 
@@ -3074,6 +3453,15 @@ static int cmd_switch(int argc, char **argv) {
     } else if (strcasecmp(argv[1], "6502") == 0) {
         active_cpu = ACTIVE_CPU_6502;
         console_printf("Switched to MOS 6502 emulator\n");
+    } else if (strcasecmp(argv[1], "apple2e") == 0 || strcasecmp(argv[1], "apple2") == 0 || strcasecmp(argv[1], "a2") == 0) {
+        active_cpu = ACTIVE_CPU_APPLE2E;
+        console_printf("Switched to Apple IIe emulator\n");
+    } else if (strcasecmp(argv[1], "c128") == 0 || strcasecmp(argv[1], "128") == 0) {
+        active_cpu = ACTIVE_CPU_C128;
+        console_printf("Switched to Commodore 128 emulator\n");
+    } else if (strcasecmp(argv[1], "z80") == 0 || strcasecmp(argv[1], "cpm") == 0) {
+        active_cpu = ACTIVE_CPU_Z80;
+        console_printf("Switched to Z80 CP/M emulator\n");
     } else {
         console_printf("Unknown CPU: %s\n", argv[1]);
         return 1;
@@ -3112,6 +3500,15 @@ static int cmd_run86(int argc, char **argv) {
 static void i86_run_task(void *arg) {
     i86_boot_and_run();
     s_i86_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ---- ESP32 Native OS task ----
+
+static void esp32os_run_task(void *arg) {
+    esp32_os_run(arg);
+    printf("ESP32 Native OS exited.\n");
+    s_esp32os_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -3517,7 +3914,8 @@ static void mos6502_run_task(void *arg) {
             printf("6502 halted during boot\n");
             goto task_exit;
         }
-        mos6502_emu_tick((uint32_t)cycles);
+        // Note: mos6502_emu_tick() is called per-instruction inside
+        // mos6502_emu_run() for C64/C128 modes (accurate raster timing)
         total_cycles += (uint32_t)cycles;
 
         // Yield every ~50k cycles so watchdog doesn't trigger
@@ -3547,7 +3945,8 @@ static void mos6502_run_task(void *arg) {
             break;
         }
 
-        mos6502_emu_tick((uint32_t)cycles);
+        // Note: mos6502_emu_tick() is called per-instruction inside
+        // mos6502_emu_run() for C64/C128 modes (accurate raster timing)
         cycles_since_render += (uint32_t)cycles;
 
         // Poll keyboard every ~4 batches
@@ -3575,6 +3974,81 @@ task_exit:
     printf("Returned to BIOS.\n");
     fflush(stdout);
     s_6502_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ============================================================================
+// Apple IIe emulator run task
+// ============================================================================
+static void apple2e_run_task(void *arg) {
+    const uint32_t BATCH_INSTRUCTIONS = 500;
+    const uint32_t BOOT_CYCLES = 2000000;  // ~2 seconds at 1MHz
+    uint32_t total_cycles = 0;
+    uint32_t cycles_since_render = 0;
+    uint32_t poll_counter = 0;
+    bool boot_complete = false;
+
+    // Switch video card to GFX mode for Apple II graphics
+    if (video_card_is_initialized()) {
+        video_card_enter_gfx_mode();
+        video_card_present();
+    }
+
+    // Phase 1: Boot - run fast without rendering
+    while (!boot_complete) {
+        uint64_t cycles = apple2e_run(BATCH_INSTRUCTIONS);
+        if (apple2e_is_halted()) {
+            printf("Apple IIe halted during boot\n");
+            goto a2_task_exit;
+        }
+        total_cycles += (uint32_t)cycles;
+        cycles_since_render += (uint32_t)cycles;
+        if (cycles_since_render >= 50000) {
+            cycles_since_render = 0;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (total_cycles >= BOOT_CYCLES) {
+            boot_complete = true;
+        }
+    }
+
+    // Phase 2: First render
+    printf("\033[2J\033[H");
+    fflush(stdout);
+    apple2e_render_screen();
+    cycles_since_render = 0;
+
+    // Phase 3: Normal 60Hz loop
+    while (true) {
+        uint64_t cycles = apple2e_run(BATCH_INSTRUCTIONS);
+        if (apple2e_is_halted()) {
+            printf("\033[27;1HApple IIe halted\n");
+            break;
+        }
+        cycles_since_render += (uint32_t)cycles;
+
+        if (++poll_counter >= 4) {
+            poll_counter = 0;
+            apple2e_poll_keyboard();
+            if (apple2e_exit_requested()) {
+                printf("\033[27;1H\nExiting Apple IIe...\n");
+                fflush(stdout);
+                break;
+            }
+        }
+
+        if (cycles_since_render >= 16667) {
+            cycles_since_render = 0;
+            apple2e_render_screen();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+a2_task_exit:
+    printf("\033[2J\033[H");
+    printf("Returned to BIOS.\n");
+    fflush(stdout);
+    s_apple2e_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -3754,6 +4228,135 @@ static void register_6502_commands(void) {
           .hint = "[addr] [len]", .func = &cmd_dump6502 },
         { .command = "poke6502", .help = "Write byte to 6502 memory",
           .hint = "<addr> <byte>", .func = &cmd_poke6502 },
+    };
+    for (int i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++) {
+        ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
+    }
+}
+
+// ============================================================================
+// Apple IIe Commands
+// ============================================================================
+
+static int cmd_inita2(int argc, char **argv) {
+    if (apple2e_is_initialized()) {
+        console_printf("Apple IIe already initialized\n");
+        return 0;
+    }
+    if (!video_card_is_initialized()) {
+        video_card_init();
+    }
+    esp_err_t ret = apple2e_init();
+    if (ret != ESP_OK) {
+        console_printf("Init failed: %s\n", esp_err_to_name(ret));
+        return 1;
+    }
+    apple2e_load_roms();
+    apple2e_reset();
+    console_printf("Apple IIe initialized and reset\n");
+    return 0;
+}
+
+static int cmd_reseta2(int argc, char **argv) {
+    if (!apple2e_is_initialized()) { console_printf("Apple IIe not initialized\n"); return 1; }
+    apple2e_reset();
+    console_printf("Apple IIe reset\n");
+    return 0;
+}
+
+static int cmd_statea2(int argc, char **argv) {
+    if (!apple2e_is_initialized()) { console_printf("Apple IIe not initialized\n"); return 1; }
+    char buf[512];
+    apple2e_get_state(buf, sizeof(buf));
+    console_printf("%s", buf);
+    return 0;
+}
+
+static int cmd_stepa2(int argc, char **argv) {
+    if (!apple2e_is_initialized()) { console_printf("Apple IIe not initialized\n"); return 1; }
+    apple2e_step();
+    char buf[256];
+    apple2e_get_state(buf, sizeof(buf));
+    console_printf("%s", buf);
+    return 0;
+}
+
+static int cmd_runa2(int argc, char **argv) {
+    if (!apple2e_is_initialized()) { console_printf("Apple IIe not initialized\n"); return 1; }
+    if (argc > 1) {
+        uint32_t count = strtoul(argv[1], NULL, 0);
+        apple2e_run(count);
+        char buf[512];
+        apple2e_get_state(buf, sizeof(buf));
+        console_printf("%s", buf);
+    } else {
+        if (s_apple2e_task_handle) {
+            console_printf("Apple IIe already running\n");
+            return 0;
+        }
+        apple2e_reset();
+        active_cpu = ACTIVE_CPU_APPLE2E;
+        xTaskCreate(apple2e_run_task, "apple2e", 8192, NULL, 5, &s_apple2e_task_handle);
+        console_printf("Apple IIe running in background\n");
+    }
+    return 0;
+}
+
+static int cmd_stopa2(int argc, char **argv) {
+    if (s_apple2e_task_handle) {
+        apple2e_stop();
+        console_printf("Stopping Apple IIe...\n");
+    } else {
+        console_printf("Apple IIe not running\n");
+    }
+    return 0;
+}
+
+static int cmd_dumpa2(int argc, char **argv) {
+    if (!apple2e_is_initialized()) { console_printf("Apple IIe not initialized\n"); return 1; }
+    uint32_t addr = 0;
+    uint32_t len = 256;
+    if (argc > 1) addr = strtoul(argv[1], NULL, 16);
+    if (argc > 2) len = strtoul(argv[2], NULL, 16);
+    apple2e_dump_memory(addr, len);
+    return 0;
+}
+
+static int cmd_a2disk(int argc, char **argv) {
+    if (!apple2e_is_initialized()) { console_printf("Apple IIe not initialized\n"); return 1; }
+    if (argc < 2) {
+        console_printf("Usage: a2disk <path> [drive 0|1]\n");
+        return 1;
+    }
+    int drive = 0;
+    if (argc > 2) drive = atoi(argv[2]);
+    esp_err_t ret = apple2e_mount_disk(drive, argv[1]);
+    if (ret == ESP_OK) {
+        console_printf("Disk mounted in drive %d\n", drive + 1);
+    } else {
+        console_printf("Failed to mount: %s\n", esp_err_to_name(ret));
+    }
+    return 0;
+}
+
+static void register_apple2e_commands(void) {
+    const esp_console_cmd_t cmds[] = {
+        { .command = "inita2",  .help = "Initialize Apple IIe emulator",
+          .func = &cmd_inita2 },
+        { .command = "reseta2", .help = "Reset Apple IIe",
+          .func = &cmd_reseta2 },
+        { .command = "statea2", .help = "Show Apple IIe state",
+          .func = &cmd_statea2 },
+        { .command = "stepa2",  .help = "Single-step Apple IIe",
+          .func = &cmd_stepa2 },
+        { .command = "runa2",   .help = "Run Apple IIe [count] or continuously",
+          .hint = "[count]", .func = &cmd_runa2 },
+        { .command = "stopa2",  .help = "Stop Apple IIe",
+          .func = &cmd_stopa2 },
+        { .command = "dumpa2",  .help = "Dump Apple IIe memory",
+          .hint = "[addr] [len]", .func = &cmd_dumpa2 },
+        { .command = "a2disk",  .help = "Mount disk image in Apple IIe",
+          .hint = "<path> [drive]", .func = &cmd_a2disk },
     };
     for (int i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -4271,6 +4874,7 @@ void app_main(void) {
     register_m68k_commands();
     register_i8086_commands();
     register_6502_commands();
+    register_apple2e_commands();
     register_video_commands();
     register_i386_commands();       // Register i386 emulator commands
     register_bluetooth_commands();  // Register Bluetooth commands
@@ -4388,6 +4992,9 @@ void app_main(void) {
         printf("  Continuing without USB keyboard support\n");
     }
     
+    // Register SD card auto-mount callback so FTP server can mount it automatically
+    ftp_server_set_mount_cb(mount_sd_card);
+
     // Initialize WiFi with ESP32-C6 coprocessor (SDIO)
     printf("Initializing WiFi (ESP32-C6 via SDIO)...\n");
     
@@ -4438,6 +5045,21 @@ void app_main(void) {
     } else {
         printf("✗ WiFi init failed: %s\n", esp_err_to_name(ret));
         printf("  WiFi commands will not be available\n");
+    }
+    
+    // Initialize Ethernet (RJ45 100M with IP101 PHY)
+    printf("Initializing Ethernet (RJ45 100M)...\n");
+    // Register Ethernet event handlers for auto-starting services
+    esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler_main, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_event_handler_main, NULL);
+    ret = ethernet_init();
+    if (ret == ESP_OK) {
+        ethernet_initialized = true;
+        printf("✓ Ethernet initialized (IP101 PHY)\n");
+        printf("  Plug in Ethernet cable for wired network\n");
+    } else {
+        printf("✗ Ethernet init failed: %s\n", esp_err_to_name(ret));
+        printf("  Continuing without Ethernet support\n");
     }
     
     // Initialize Bluetooth with ESP32-C6 coprocessor (SDIO)

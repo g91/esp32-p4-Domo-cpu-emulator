@@ -77,13 +77,73 @@ esp_err_t disk_mount(uint8_t drive, const char *filename, bool read_only)
     if (type >= DISK_TYPE_FLOPPY_360K && type <= DISK_TYPE_FLOPPY_2M88) {
         disk->geometry = floppy_geometries[type];
     } else {
-        // Hard disk - calculate geometry
+        // Hard disk - try to read geometry from BPB in boot sector
         uint32_t total_sectors = size / 512;
         disk->geometry.bytes_per_sector = 512;
         disk->geometry.total_sectors = total_sectors;
-        disk->geometry.sectors_per_track = 63;
-        disk->geometry.heads = 16;
-        disk->geometry.cylinders = total_sectors / (63 * 16);
+
+        // Defaults
+        uint16_t spt = 63;
+        uint16_t heads = 16;
+
+        // Read boot sector to check for BPB/MBR geometry
+        uint8_t bootsect[512];
+        if (fread(bootsect, 512, 1, f) == 1) {
+            fseek(f, 0, SEEK_SET);
+            bool found_geometry = false;
+
+            // Check if this is a VBR (Volume Boot Record) with BPB
+            // VBRs start with JMP (0xEB xx 0x90 or 0xE9 xx xx) and have BPB
+            bool looks_like_vbr = (bootsect[0] == 0xEB || bootsect[0] == 0xE9);
+            uint16_t bpb_bps = bootsect[0x0B] | (bootsect[0x0C] << 8);
+            uint16_t bpb_spt = bootsect[0x18] | (bootsect[0x19] << 8);
+            uint16_t bpb_heads = bootsect[0x1A] | (bootsect[0x1B] << 8);
+
+            if (looks_like_vbr && bpb_bps == 512 &&
+                bpb_spt >= 1 && bpb_spt <= 63 &&
+                bpb_heads >= 1 && bpb_heads <= 255) {
+                // Valid BPB geometry found
+                spt = bpb_spt;
+                heads = bpb_heads;
+                found_geometry = true;
+                ESP_LOGI(TAG, "  Geometry from BPB: H=%d S=%d", heads, spt);
+            }
+
+            // If not a VBR, check for MBR partition table
+            if (!found_geometry && bootsect[510] == 0x55 && bootsect[511] == 0xAA) {
+                // Scan all 4 partition entries for a valid one
+                for (int p = 0; p < 4 && !found_geometry; p++) {
+                    uint8_t *part = &bootsect[0x1BE + p * 16];
+                    uint8_t boot_ind = part[0];
+                    uint8_t part_type = part[4];
+
+                    if ((boot_ind == 0x80 || boot_ind == 0x00) && part_type != 0) {
+                        // Extract geometry from partition end CHS
+                        uint8_t end_head = part[5];
+                        uint8_t end_sec = part[6] & 0x3F;
+                        if (end_sec > 0 && end_head > 0) {
+                            heads = end_head + 1;
+                            spt = end_sec;
+                            found_geometry = true;
+                            ESP_LOGI(TAG, "  Geometry from MBR part%d: H=%d S=%d", p, heads, spt);
+                        }
+                    }
+                }
+            }
+
+            if (!found_geometry) {
+                ESP_LOGI(TAG, "  Using default geometry: H=%d S=%d", heads, spt);
+            }
+        } else {
+            fseek(f, 0, SEEK_SET);
+        }
+
+        disk->geometry.sectors_per_track = spt;
+        disk->geometry.heads = heads;
+        disk->geometry.cylinders = total_sectors / (spt * heads);
+        if (disk->geometry.cylinders == 0 && total_sectors > 0) {
+            disk->geometry.cylinders = 1;
+        }
     }
 
     ESP_LOGI(TAG, "Mounted drive %d: %s (%s, %llu bytes, %s)",
@@ -288,16 +348,21 @@ int32_t disk_chs_to_lba(uint8_t drive, uint16_t cylinder, uint8_t head, uint8_t 
     }
 
     disk_geometry_t *geom = &disk->geometry;
-    
+
     // Sector is 1-based in CHS
     if (sector == 0 || sector > geom->sectors_per_track) {
         return -1;
     }
-    if (head >= geom->heads || cylinder >= geom->cylinders) {
+    if (head >= geom->heads) {
         return -1;
     }
 
     uint32_t lba = (cylinder * geom->heads + head) * geom->sectors_per_track + (sector - 1);
+
+    // Validate against total sectors (more reliable than cylinder count)
+    if (lba >= geom->total_sectors) {
+        return -1;
+    }
     return lba;
 }
 

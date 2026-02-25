@@ -255,9 +255,9 @@ static uint16_t seg_override;
 static uint32_t op_source, op_dest, set_flags_type;
 static int32_t  op_to_addr, op_from_addr;
 
-// Memory access macros
-#define MEM8(addr)  g_cpu.memory[addr]
-#define MEM16(addr) (*(uint16_t*)(g_cpu.memory + (addr)))
+// Memory access macros - mask to 20-bit address space (8086 has no A20 gate)
+#define MEM8(addr)  g_cpu.memory[(addr) & 0xFFFFF]
+#define MEM16(addr) (*(uint16_t*)(g_cpu.memory + ((addr) & 0xFFFFF)))
 
 // Register access
 #define REGS8   ((uint8_t*)g_cpu.regs16)
@@ -283,16 +283,29 @@ static int32_t  op_to_addr, op_from_addr;
 #define F_DF (FLAGS[DF_ADDR])
 #define F_OF (FLAGS[OF_ADDR])
 
+// PC/XT memory map boundaries
+// 0x00000-0x9FFFF: Conventional RAM (640KB)
+// 0xA0000-0xBFFFF: Video memory (128KB) - via callbacks
+// 0xC0000-0xEFFFF: Expansion ROM area (192KB) - read-only, 0xFF if empty
+// 0xF0000-0xFFFFF: BIOS ROM (64KB) - read-only
+#define EXROM_START 0xC0000  // Expansion ROM area start
+
 // Memory read with register and video callback support
 // When addr is in the register range (REGS_BASE..REGS_BASE+31),
 // redirect to the CPU register array instead of physical memory.
+// Physical addresses are masked to 20 bits (8086 wraps at 1MB).
 static uint8_t RMEM8(int addr) {
     unsigned reg_off = (unsigned)(addr - REGS_BASE);
     if (reg_off < 32u) {
         return ((uint8_t*)g_cpu.regs16)[reg_off];
     }
+    addr &= 0xFFFFF;  // 20-bit wrap (no A20 on 8086)
     if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.read_video8) {
         return g_cpu.read_video8(g_cpu.callback_ctx, addr);
+    }
+    // Expansion ROM area (C0000-EFFFF): empty ROM sockets read as 0xFF
+    if (addr >= EXROM_START && addr < BIOSMEM_START) {
+        return 0xFF;
     }
     return g_cpu.memory[addr];
 }
@@ -302,8 +315,13 @@ static uint16_t RMEM16(int addr) {
     if (reg_off < 32u) {
         return *(uint16_t*)((uint8_t*)g_cpu.regs16 + reg_off);
     }
+    addr &= 0xFFFFF;
     if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.read_video16) {
         return g_cpu.read_video16(g_cpu.callback_ctx, addr);
+    }
+    // Expansion ROM area (C0000-EFFFF): empty ROM sockets read as 0xFFFF
+    if (addr >= EXROM_START && addr < BIOSMEM_START) {
+        return 0xFFFF;
     }
     return *(uint16_t*)(g_cpu.memory + addr);
 }
@@ -313,10 +331,16 @@ static inline uint8_t WMEM8(int addr, uint8_t value) {
     unsigned reg_off = (unsigned)(addr - REGS_BASE);
     if (reg_off < 32u) {
         ((uint8_t*)g_cpu.regs16)[reg_off] = value;
-    } else if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video8) {
-        g_cpu.write_video8(g_cpu.callback_ctx, addr, value);
     } else {
-        g_cpu.memory[addr] = value;
+        addr &= 0xFFFFF;
+        if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video8) {
+            g_cpu.write_video8(g_cpu.callback_ctx, addr, value);
+        } else if (addr < VIDEOMEM_START) {
+            // Conventional RAM (0x00000-0x9FFFF) - writable
+            g_cpu.memory[addr] = value;
+        }
+        // C0000-EFFFF: expansion ROM (read-only, writes ignored)
+        // F0000-FFFFF: BIOS ROM (read-only, writes ignored)
     }
     return value;
 }
@@ -325,10 +349,16 @@ static inline uint16_t WMEM16(int addr, uint16_t value) {
     unsigned reg_off = (unsigned)(addr - REGS_BASE);
     if (reg_off < 32u) {
         *(uint16_t*)((uint8_t*)g_cpu.regs16 + reg_off) = value;
-    } else if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video16) {
-        g_cpu.write_video16(g_cpu.callback_ctx, addr, value);
     } else {
-        *(uint16_t*)(g_cpu.memory + addr) = value;
+        addr &= 0xFFFFF;
+        if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END && g_cpu.write_video16) {
+            g_cpu.write_video16(g_cpu.callback_ctx, addr, value);
+        } else if (addr < VIDEOMEM_START) {
+            // Conventional RAM (0x00000-0x9FFFF) - writable
+            *(uint16_t*)(g_cpu.memory + addr) = value;
+        }
+        // C0000-EFFFF: expansion ROM (read-only, writes ignored)
+        // F0000-FFFFF: BIOS ROM (read-only, writes ignored)
     }
     return value;
 }
@@ -408,7 +438,7 @@ static uint8_t raise_divide_by_zero(void) {
     if (seg_override_en || rep_override_en) {
         // Go back looking for prefixes
         while (1) {
-            uint8_t opcode = MEM8(16 * REGS16[REG_CS] + REG_IP - 1);
+            uint8_t opcode = MEM8((16 * REGS16[REG_CS] + REG_IP - 1) & 0xFFFFF);
             if ((opcode & 0xfe) != 0xf2 && (opcode & 0xe7) != 0x26)
                 break;
             --REG_IP;
@@ -547,7 +577,7 @@ void i86_cpu_step(void) {
         if (seg_override_en) --seg_override_en;
         if (rep_override_en) --rep_override_en;
         
-        const uint8_t *opcode_stream = g_cpu.memory + 16 * REGS16[REG_CS] + REG_IP;
+        const uint8_t *opcode_stream = g_cpu.memory + ((16 * REGS16[REG_CS] + REG_IP) & 0xFFFFF);
         
         // Quick processing for common instructions
         switch (optcodes[*opcode_stream]) {

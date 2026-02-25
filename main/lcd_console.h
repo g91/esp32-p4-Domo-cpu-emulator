@@ -130,15 +130,17 @@ void lcd_console_get_pins(int *rst_pin, int *bl_pin, int *mosi_pin, int *clk_pin
  * 
  * Used by VGA emulation to output framebuffer directly to LCD.
  * Data must be in DMA-capable memory or will be copied internally.
+ * Thread-safe: acquires SPI mutex before transmission.
  * 
  * @param x_start Start X coordinate
  * @param y_start Start Y coordinate
  * @param x_end End X coordinate (exclusive)
  * @param y_end End Y coordinate (exclusive)
  * @param data RGB565 pixel data
+ * @return ESP_OK on success, error code on SPI failure
  */
-void lcd_console_draw_raw(int x_start, int y_start, int x_end, int y_end,
-                          const void *data);
+esp_err_t lcd_console_draw_raw(int x_start, int y_start, int x_end, int y_end,
+                               const void *data);
 
 #ifdef __cplusplus
 }

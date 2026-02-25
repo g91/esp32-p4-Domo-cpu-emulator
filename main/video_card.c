@@ -523,6 +523,9 @@ static void render_text_to_framebuffer(void) {
 // ============================================================================
 
 static void video_refresh_task(void *arg) {
+    uint32_t spi_error_count = 0;
+    bool spi_error_reported = false;
+
     while (s_vid.initialized) {
         if (s_vid.enabled && s_vid.front_buf && s_vid.dma_buf) {
             if (s_vid.mutex && xSemaphoreTake(s_vid.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -534,6 +537,7 @@ static void video_refresh_task(void *arg) {
                 }
 
                 // Transfer front_buf to LCD in DMA strips
+                bool frame_ok = true;
                 for (int y = 0; y < s_vid.height; y += DMA_STRIP_HEIGHT) {
                     int strip_h = DMA_STRIP_HEIGHT;
                     if (y + strip_h > s_vid.height) strip_h = s_vid.height - y;
@@ -542,12 +546,45 @@ static void video_refresh_task(void *arg) {
                     memcpy(s_vid.dma_buf, &s_vid.front_buf[y * s_vid.width],
                            strip_pixels * sizeof(uint16_t));
 
-                    lcd_console_draw_raw(0, y, s_vid.width, y + strip_h, s_vid.dma_buf);
+                    esp_err_t ret = lcd_console_draw_raw(0, y, s_vid.width, y + strip_h, s_vid.dma_buf);
+                    if (ret != ESP_OK) {
+                        spi_error_count++;
+                        if (!spi_error_reported) {
+                            ESP_LOGE(TAG, "SPI draw_raw failed at y=%d: %s (0x%x), stack free=%u",
+                                     y, esp_err_to_name(ret), (unsigned)ret,
+                                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
+                            spi_error_reported = true;
+                        }
+                        // Skip remaining strips this frame — SPI bus is likely in error state
+                        frame_ok = false;
+                        break;
+                    }
+
+                    // Yield every 10 strips to let SPI ISR/DMA and other tasks breathe
+                    if ((y / DMA_STRIP_HEIGHT) % 10 == 9) {
+                        taskYIELD();
+                    }
+                }
+
+                if (frame_ok) {
+                    // Reset error tracking on a successful full frame
+                    if (spi_error_count > 0) {
+                        ESP_LOGI(TAG, "SPI recovered after %lu errors", (unsigned long)spi_error_count);
+                        spi_error_count = 0;
+                        spi_error_reported = false;
+                    }
                 }
 
                 s_vid.vblank = true;
                 s_vid.frame_count++;
                 xSemaphoreGive(s_vid.mutex);
+
+                // If SPI is failing, back off to avoid flooding logs
+                if (!frame_ok) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    spi_error_reported = false;  // Allow next error to be logged
+                    continue;  // Skip the normal delay, go straight to retry
+                }
             }
         }
 
@@ -1145,8 +1182,8 @@ esp_err_t video_card_init(void) {
     s_vid.enabled = true;
 
     // Start refresh task (sends framebuffer to LCD at configured rate)
-    // Stack needs 6KB+ for SPI transaction overhead in esp_lcd_panel_draw_bitmap
-    xTaskCreate(video_refresh_task, "vid_refresh", 6144, NULL, 5, &s_vid.refresh_task);
+    // Stack needs 12KB for SPI transaction overhead + FreeRTOS + error handling
+    xTaskCreate(video_refresh_task, "vid_refresh", 12288, NULL, 5, &s_vid.refresh_task);
 
     ESP_LOGI(TAG, "Video card initialized: %dx%d, TEXT mode (%dx%d chars), %dHz refresh",
              s_vid.width, s_vid.height, VID_TEXT_COLS, VID_TEXT_ROWS, s_vid.refresh_rate);
@@ -1487,6 +1524,11 @@ void video_card_enter_gfx_mode(void) {
     if (!s_vid.initialized) return;
     if (!s_vid.text_mode) return;  // Already in GFX mode
 
+    // Take mutex to prevent race with video_refresh_task reading front_buf
+    if (s_vid.mutex) {
+        xSemaphoreTake(s_vid.mutex, portMAX_DELAY);
+    }
+
     s_vid.text_mode = false;
     s_vid.bpp = 16;
     s_vid.width = VIDEO_MAX_WIDTH;
@@ -1505,6 +1547,10 @@ void video_card_enter_gfx_mode(void) {
         memset(s_vid.front_buf, 0, VIDEO_MAX_WIDTH * VIDEO_MAX_HEIGHT * sizeof(uint16_t));
     if (s_vid.back_buf)
         memset(s_vid.back_buf, 0, VIDEO_MAX_WIDTH * VIDEO_MAX_HEIGHT * sizeof(uint16_t));
+
+    if (s_vid.mutex) {
+        xSemaphoreGive(s_vid.mutex);
+    }
 
     ESP_LOGI(TAG, "Switched to GFX mode: %dx%d (for emulator rendering)", s_vid.width, s_vid.height);
 }

@@ -19,12 +19,14 @@
 #include "disk_image.h"
 #include "video_card.h"
 #include "ps2_keyboard.h"
+#include "usb_keyboard.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 #include <ctype.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -102,21 +104,11 @@ static struct {
     // PC Hardware
     pc_hardware_t hw;
 
-    // BIOS keyboard buffer (INT 16h)
-    // Stored as (scancode << 8) | ascii, circular buffer at BDA 0x41E
-    uint16_t bios_kbd_buffer[16];
-    int bios_kbd_head;
-    int bios_kbd_tail;
-
     // Video mode
     uint8_t video_mode;
     uint8_t cursor_x, cursor_y;
     uint8_t text_attr;
     uint8_t active_page;
-
-    // Timer tick count (for INT 1Ah)
-    uint32_t timer_ticks;
-    bool     timer_midnight;
 
     // DOS state
     dos_state_t dos;
@@ -196,22 +188,51 @@ static uint8_t port_read_handler(void *ctx, uint16_t port) {
 
 static void port_write_handler(void *ctx, uint16_t port, uint8_t value) {
     pc_hw_write_port(&s_i86.hw, port, value);
+    // When CGA mode register or CRTC registers change, force a refresh
+    // This handles the case where the kernel disables video (clears bit 3),
+    // writes to VRAM, then re-enables video. Without this, the re-enable
+    // wouldn't trigger a refresh because video_dirty was already cleared.
+    if (port == 0x3D8 || port == 0x3D4 || port == 0x3D5 || port == 0x3D9) {
+        s_i86.video_dirty = true;
+        // Diagnostic: log CGA mode register changes
+        if (port == 0x3D8) {
+            static uint8_t last_mode = 0x29;
+            if (value != last_mode) {
+                ESP_LOGI(TAG, "CGA mode_reg: %02X -> %02X (en=%d)", last_mode, value, (value & 0x08) ? 1 : 0);
+                last_mode = value;
+            }
+        }
+    }
 }
 
 // ============================================================================
 // Video Memory Handlers
 // ============================================================================
 
+// CGA video RAM: only 16KB at B8000-BBFFF is real hardware.
+// A0000-B7FFF (EGA/VGA/MDA) and BC000-BFFFF are empty on a CGA card.
+// Reads from empty areas return 0xFF; writes are ignored.
+// This prevents the kernel from detecting "RAM" in the video area.
+#define CGA_VRAM_START  0xB8000
+#define CGA_VRAM_END    0xBC000  // 16KB CGA RAM
+
 static void video_write8(void *ctx, uint32_t addr, uint8_t value) {
-    uint8_t *mem = i86_cpu_get_memory();
-    if (addr < I8086_TOTAL_MEMORY) {
+    // Only CGA range (B8000-BBFFF) is writable video RAM
+    if (addr >= CGA_VRAM_START && addr < CGA_VRAM_END) {
+        uint8_t *mem = i86_cpu_get_memory();
         mem[addr] = value;
-        // Mark video dirty if writing to text mode area
-        if (addr >= 0xB8000 && addr < 0xB9000) {
-            s_i86.video_dirty = true;
-            s_i86.hw.cga.needs_refresh = true;
+        s_i86.video_dirty = true;
+        s_i86.hw.cga.needs_refresh = true;
+
+        // Diagnostic: log first few direct VRAM writes (character bytes only)
+        static int vram_write_count = 0;
+        if (vram_write_count < 30 && ((addr - CGA_VRAM_START) & 1) == 0 && value >= 0x20 && value < 0x7F) {
+            ESP_LOGI(TAG, "VRAM[%03X]='%c' mode=%02X",
+                     (unsigned)(addr - CGA_VRAM_START), value, s_i86.hw.cga.mode_reg);
+            vram_write_count++;
         }
     }
+    // A0000-B7FFF and BC000-BFFFF: no memory here on CGA, writes ignored
 }
 
 static void video_write16(void *ctx, uint32_t addr, uint16_t value) {
@@ -220,9 +241,13 @@ static void video_write16(void *ctx, uint32_t addr, uint16_t value) {
 }
 
 static uint8_t video_read8(void *ctx, uint32_t addr) {
-    uint8_t *mem = i86_cpu_get_memory();
-    if (addr < I8086_TOTAL_MEMORY) return mem[addr];
-    return 0;
+    // Only CGA range (B8000-BBFFF) has real video RAM
+    if (addr >= CGA_VRAM_START && addr < CGA_VRAM_END) {
+        uint8_t *mem = i86_cpu_get_memory();
+        return mem[addr];
+    }
+    // A0000-B7FFF and BC000-BFFFF: empty, reads return 0xFF
+    return 0xFF;
 }
 
 static uint16_t video_read16(void *ctx, uint32_t addr) {
@@ -250,10 +275,111 @@ static inline uint16_t bda_read16(uint16_t addr) {
 }
 
 // ============================================================================
+// BDA Keyboard Buffer Helpers
+// Buffer at 0040:001E-003D (16 words), pointers are offsets from seg 0040h
+// ============================================================================
+
+static bool bda_kbd_push(uint16_t key) {
+    uint16_t tail = bda_read16(BDA_KBD_TAIL);
+    uint16_t next_tail = tail + 2;
+    if (next_tail >= 0x003E) next_tail = 0x001E;
+    if (next_tail == bda_read16(BDA_KBD_HEAD)) return false; // Full
+    bda_write16(0x0400 + tail, key);
+    bda_write16(BDA_KBD_TAIL, next_tail);
+    return true;
+}
+
+static bool bda_kbd_pop(uint16_t *key) {
+    uint16_t head = bda_read16(BDA_KBD_HEAD);
+    if (head == bda_read16(BDA_KBD_TAIL)) return false; // Empty
+    *key = bda_read16(0x0400 + head);
+    head += 2;
+    if (head >= 0x003E) head = 0x001E;
+    bda_write16(BDA_KBD_HEAD, head);
+    return true;
+}
+
+#if 0  // Unused function - kept for reference
+static bool bda_kbd_peek(uint16_t *key) {
+    uint16_t head = bda_read16(BDA_KBD_HEAD);
+    if (head == bda_read16(BDA_KBD_TAIL)) return false;
+    *key = bda_read16(0x0400 + head);
+    return true;
+}
+#endif
+
+static bool bda_kbd_empty(void) {
+    return bda_read16(BDA_KBD_HEAD) == bda_read16(BDA_KBD_TAIL);
+}
+
+static void bda_kbd_flush(void) {
+    bda_write16(BDA_KBD_HEAD, 0x001E);
+    bda_write16(BDA_KBD_TAIL, 0x001E);
+}
+
+// ============================================================================
 // Helper: Console output (goes to both UART + LCD)
 // ============================================================================
 
 static void pc_putchar(char c) {
+    // --- Output diagnostics ---
+    {
+        static int total_chars = 0;
+        static int non_ascii_logged = 0;
+        total_chars++;
+
+        // Log first 5 non-ASCII characters with hex value
+        if ((uint8_t)c > 0x7E && non_ascii_logged < 5) {
+            ESP_LOGI(TAG, "Non-ASCII char #%d: 0x%02X at char position %d",
+                     non_ascii_logged + 1, (uint8_t)c, total_chars);
+            non_ascii_logged++;
+        }
+
+        // At char 50 (early boot), dump IVT state
+        if (total_chars == 50) {
+            uint8_t *mem = i86_cpu_get_memory();
+            #define IVT_SEG(n) (mem[(n)*4+2] | (mem[(n)*4+3] << 8))
+            #define IVT_OFF(n) (mem[(n)*4+0] | (mem[(n)*4+1] << 8))
+            ESP_LOGI(TAG, "EARLY IVT @char %d: 21h=%04X:%04X 29h=%04X:%04X 13h=%04X:%04X 20h=%04X:%04X",
+                total_chars,
+                IVT_SEG(0x21), IVT_OFF(0x21),
+                IVT_SEG(0x29), IVT_OFF(0x29),
+                IVT_SEG(0x13), IVT_OFF(0x13),
+                IVT_SEG(0x20), IVT_OFF(0x20));
+            #undef IVT_SEG
+            #undef IVT_OFF
+        }
+
+        // At character 2000 (well into the copyright loop), dump full state
+        if (total_chars == 2000) {
+            uint8_t *mem = i86_cpu_get_memory();
+            #define IVT_SEG(n) (mem[(n)*4+2] | (mem[(n)*4+3] << 8))
+            #define IVT_OFF(n) (mem[(n)*4+0] | (mem[(n)*4+1] << 8))
+            ESP_LOGE(TAG, "LOOP DIAG @char %d: CS:IP=%04X:%04X SS:SP=%04X:%04X",
+                total_chars, i86_cpu_get_cs(), i86_cpu_get_ip(),
+                i86_cpu_get_ss(), i86_cpu_get_sp());
+            ESP_LOGE(TAG, "IVT: 08h=%04X:%04X 10h=%04X:%04X 13h=%04X:%04X 16h=%04X:%04X",
+                IVT_SEG(0x08), IVT_OFF(0x08),
+                IVT_SEG(0x10), IVT_OFF(0x10),
+                IVT_SEG(0x13), IVT_OFF(0x13),
+                IVT_SEG(0x16), IVT_OFF(0x16));
+            ESP_LOGE(TAG, "IVT: 21h=%04X:%04X 29h=%04X:%04X 2Fh=%04X:%04X 20h=%04X:%04X",
+                IVT_SEG(0x21), IVT_OFF(0x21),
+                IVT_SEG(0x29), IVT_OFF(0x29),
+                IVT_SEG(0x2F), IVT_OFF(0x2F),
+                IVT_SEG(0x20), IVT_OFF(0x20));
+            #undef IVT_SEG
+            #undef IVT_OFF
+            // Stack dump
+            uint32_t sp_addr = ((uint32_t)i86_cpu_get_ss() * 16 + i86_cpu_get_sp()) & 0xFFFFF;
+            ESP_LOGE(TAG, "Stack: %04X %04X %04X %04X %04X %04X %04X %04X",
+                *(uint16_t*)(mem+sp_addr), *(uint16_t*)(mem+sp_addr+2),
+                *(uint16_t*)(mem+sp_addr+4), *(uint16_t*)(mem+sp_addr+6),
+                *(uint16_t*)(mem+sp_addr+8), *(uint16_t*)(mem+sp_addr+10),
+                *(uint16_t*)(mem+sp_addr+12), *(uint16_t*)(mem+sp_addr+14));
+        }
+    }
+
     // Write to CGA video RAM
     uint8_t *video = i86_cpu_get_video();
     if (!video) return;
@@ -300,6 +426,10 @@ static void pc_putchar(char c) {
         s_i86.cursor_y = 24;
     }
 
+    // Sync CGA hardware cursor
+    s_i86.hw.cga.cursor_pos = s_i86.cursor_y * 80 + s_i86.cursor_x;
+    s_i86.hw.cga.cursor_visible = true;
+    bda_write16(BDA_CURSOR_POS, (s_i86.cursor_y << 8) | s_i86.cursor_x);
     s_i86.video_dirty = true;
 
     // Also output to UART for debugging
@@ -380,28 +510,36 @@ static void poll_input(void);
 
 static bool handle_int08h(void) {
     // INT 08h - Timer tick (IRQ 0)
-    s_i86.timer_ticks++;
+    // When the IVT still points to our BIOS, handle via callback for speed.
+    // When FreeDOS has hooked INT 08h, the callback returns false and the
+    // CPU dispatches through IVT. FreeDOS chains back to F000:E008 (real
+    // x86 code) which does BDA update + INT 1Ch + EOI + IRET.
 
-    // Update BDA timer count
+    // Update BDA timer count directly in memory
     uint8_t *mem = i86_cpu_get_memory();
-    mem[BDA_TIMER_COUNT] = s_i86.timer_ticks & 0xFF;
-    mem[BDA_TIMER_COUNT + 1] = (s_i86.timer_ticks >> 8) & 0xFF;
-    mem[BDA_TIMER_COUNT + 2] = (s_i86.timer_ticks >> 16) & 0xFF;
-    mem[BDA_TIMER_COUNT + 3] = (s_i86.timer_ticks >> 24) & 0xFF;
+    uint32_t ticks = mem[BDA_TIMER_COUNT] |
+                     ((uint32_t)mem[BDA_TIMER_COUNT + 1] << 8) |
+                     ((uint32_t)mem[BDA_TIMER_COUNT + 2] << 16) |
+                     ((uint32_t)mem[BDA_TIMER_COUNT + 3] << 24);
+    ticks++;
 
-    // Check for midnight (1573040 ticks ≈ 24 hours)
-    if (s_i86.timer_ticks >= 1573040) {
-        s_i86.timer_ticks = 0;
-        s_i86.timer_midnight = true;
+    // Check for midnight (1573040 ticks ~= 24 hours at 18.2 Hz)
+    if (ticks >= 1573040) {
+        ticks = 0;
         mem[BDA_TIMER_OFLOW] = 1;
     }
 
-    // Chain to user timer hook (INT 1Ch)
-    // The real BIOS does this, but we'll skip for simplicity
-    // as most DOS programs set their own INT 1Ch handler
+    mem[BDA_TIMER_COUNT]     = ticks & 0xFF;
+    mem[BDA_TIMER_COUNT + 1] = (ticks >> 8) & 0xFF;
+    mem[BDA_TIMER_COUNT + 2] = (ticks >> 16) & 0xFF;
+    mem[BDA_TIMER_COUNT + 3] = (ticks >> 24) & 0xFF;
 
     // Send EOI to PIC
     pc_hw_write_port(&s_i86.hw, 0x20, 0x20);
+
+    // Note: We don't chain INT 1Ch from the callback because we can't
+    // invoke a software interrupt from here. The x86 code at F000:E008
+    // handles INT 1Ch chaining when FreeDOS chains back to us.
     return true;
 }
 
@@ -500,11 +638,17 @@ static bool handle_int09h(void) {
             else if (ascii >= 'A' && ascii <= 'Z') ascii = ascii - 'A' + 1;
         }
 
-        // Add to BIOS keyboard buffer
-        int next = (s_i86.bios_kbd_head + 1) % 16;
-        if (next != s_i86.bios_kbd_tail) {
-            s_i86.bios_kbd_buffer[s_i86.bios_kbd_head] = (make_code << 8) | ascii;
-            s_i86.bios_kbd_head = next;
+        // Add to BDA keyboard buffer (the authoritative keyboard buffer)
+        // BDA buffer is at 0040:001E to 0040:003D (16 words)
+        // Head/tail are offsets relative to segment 0040h
+        uint16_t tail = bda_read16(BDA_KBD_TAIL);
+        uint16_t next_tail = tail + 2;
+        if (next_tail >= 0x003E) next_tail = 0x001E;
+        uint16_t head = bda_read16(BDA_KBD_HEAD);
+        if (next_tail != head) {  // Buffer not full
+            // Write key word (scancode:ascii) to BDA buffer
+            bda_write16(0x0400 + tail, (make_code << 8) | ascii);
+            bda_write16(BDA_KBD_TAIL, next_tail);
         }
     }
 
@@ -532,21 +676,79 @@ static bool handle_int10h(void) {
 
     switch (ah) {
         case 0x00: // Set video mode
-            s_i86.video_mode = al & 0x7F;  // Bit 7 = don't clear
-            if (!(al & 0x80)) {
-                // Clear screen
-                for (int i = 0; i < 4000; i += 2) {
-                    video[0x18000 + i] = 0x20;
-                    video[0x18000 + i + 1] = 0x07;
-                }
-                s_i86.cursor_x = 0;
-                s_i86.cursor_y = 0;
+        {
+            uint8_t mode = al & 0x7F;  // Bit 7 = don't clear
+            bool no_clear = (al & 0x80) != 0;
+            s_i86.video_mode = mode;
+
+            // Set CGA mode register based on BIOS mode number
+            switch (mode) {
+                case 0x00: // 40x25 text, B/W
+                case 0x01: // 40x25 text, color
+                    s_i86.hw.cga.mode_reg = 0x2C; // text, 40col, enable, blink
+                    bda_write16(BDA_VIDEO_COLS, 40);
+                    bda_write16(BDA_VIDEO_PAGE_SIZE, 2048);
+                    if (!no_clear) {
+                        memset(video + 0x18000, 0, 2048);
+                        for (int i = 0; i < 2000; i += 2) {
+                            video[0x18000 + i] = 0x20;
+                            video[0x18000 + i + 1] = 0x07;
+                        }
+                    }
+                    break;
+                case 0x02: // 80x25 text, B/W
+                case 0x03: // 80x25 text, color
+                    s_i86.hw.cga.mode_reg = 0x29; // text, 80col, enable
+                    bda_write16(BDA_VIDEO_COLS, 80);
+                    bda_write16(BDA_VIDEO_PAGE_SIZE, 4096);
+                    if (!no_clear) {
+                        for (int i = 0; i < 4000; i += 2) {
+                            video[0x18000 + i] = 0x20;
+                            video[0x18000 + i + 1] = 0x07;
+                        }
+                    }
+                    break;
+                case 0x04: // 320x200 graphics, 4 colors
+                case 0x05: // 320x200 graphics, 4 colors (alt palette)
+                    s_i86.hw.cga.mode_reg = 0x0A; // graphics, enable
+                    bda_write16(BDA_VIDEO_COLS, 40);
+                    bda_write16(BDA_VIDEO_PAGE_SIZE, 16384);
+                    if (!no_clear) {
+                        memset(video + 0x18000, 0, 16384);
+                    }
+                    break;
+                case 0x06: // 640x200 graphics, 2 colors
+                    s_i86.hw.cga.mode_reg = 0x1A; // graphics, 640, enable
+                    bda_write16(BDA_VIDEO_COLS, 80);
+                    bda_write16(BDA_VIDEO_PAGE_SIZE, 16384);
+                    if (!no_clear) {
+                        memset(video + 0x18000, 0, 16384);
+                    }
+                    break;
+                default:
+                    // Unknown mode - treat as 80x25 text
+                    s_i86.hw.cga.mode_reg = 0x29;
+                    bda_write16(BDA_VIDEO_COLS, 80);
+                    bda_write16(BDA_VIDEO_PAGE_SIZE, 4096);
+                    break;
             }
+
+            s_i86.cursor_x = 0;
+            s_i86.cursor_y = 0;
             s_i86.text_attr = 0x07;
-            bda_write8(BDA_VIDEO_MODE, s_i86.video_mode);
+            s_i86.active_page = 0;
+            s_i86.hw.cga.mem_offset = 0;
+            bda_write8(BDA_VIDEO_MODE, mode);
+            bda_write16(BDA_VIDEO_PAGE_OFF, 0);
+            bda_write8(BDA_ACTIVE_PAGE, 0);
+            bda_write16(BDA_CURSOR_POS, 0);
+            bda_write8(BDA_CRT_MODE, s_i86.hw.cga.mode_reg);
+            bda_write8(BDA_CRT_PALETTE, s_i86.hw.cga.color_reg);
             s_i86.video_dirty = true;
-            ESP_LOGD(TAG, "INT 10h: Set video mode %02Xh", al);
+            s_i86.hw.cga.needs_refresh = true;
+            ESP_LOGD(TAG, "INT 10h: Set video mode %02Xh (CGA reg=%02Xh)", mode, s_i86.hw.cga.mode_reg);
             return true;
+        }
 
         case 0x01: // Set cursor shape
             bda_write16(BDA_CURSOR_TYPE, cx);
@@ -557,6 +759,10 @@ static bool handle_int10h(void) {
             s_i86.cursor_y = dh;
             // Update BDA cursor position for page bh
             bda_write16(BDA_CURSOR_POS + (bh * 2), (dh << 8) | dl);
+            // Sync CGA hardware cursor so renderer draws it
+            s_i86.hw.cga.cursor_pos = dh * 80 + dl;
+            s_i86.hw.cga.cursor_visible = true;
+            s_i86.video_dirty = true;
             return true;
 
         case 0x03: // Get cursor position
@@ -675,6 +881,90 @@ static bool handle_int10h(void) {
             return true;
         }
 
+        case 0x0B: // Set color palette
+        {
+            if (bh == 0x00) {
+                // BL = background/border color (bits 0-3)
+                s_i86.hw.cga.color_reg = (s_i86.hw.cga.color_reg & 0xF0) | (bl & 0x0F);
+            } else if (bh == 0x01) {
+                // BL = palette id (0 or 1)
+                if (bl & 1) {
+                    s_i86.hw.cga.color_reg |= 0x20;  // Palette 1 (cyan/magenta/white)
+                } else {
+                    s_i86.hw.cga.color_reg &= ~0x20;  // Palette 0 (green/red/brown)
+                }
+            }
+            bda_write8(BDA_CRT_PALETTE, s_i86.hw.cga.color_reg);
+            s_i86.video_dirty = true;
+            s_i86.hw.cga.needs_refresh = true;
+            return true;
+        }
+
+        case 0x0C: // Write pixel (graphics modes)
+        {
+            uint16_t px = i86_cpu_get_cx();  // CX = column
+            uint16_t py = i86_cpu_get_dx();  // DX = row
+            uint8_t color = al;
+
+            if (s_i86.video_mode == 0x04 || s_i86.video_mode == 0x05) {
+                // 320x200, 4 colors: 2 bits per pixel
+                if (px < 320 && py < 200) {
+                    uint32_t offset = ((py & 1) ? 0x2000 : 0x0000) + (py >> 1) * 80 + (px >> 2);
+                    int shift = 6 - (px & 3) * 2;
+                    uint8_t mask = ~(0x03 << shift);
+                    uint8_t *p = &video[0x18000 + offset];
+                    if (color & 0x80) {
+                        // XOR mode
+                        *p ^= (color & 0x03) << shift;
+                    } else {
+                        *p = (*p & mask) | ((color & 0x03) << shift);
+                    }
+                    s_i86.video_dirty = true;
+                    s_i86.hw.cga.needs_refresh = true;
+                }
+            } else if (s_i86.video_mode == 0x06) {
+                // 640x200, 2 colors: 1 bit per pixel
+                if (px < 640 && py < 200) {
+                    uint32_t offset = ((py & 1) ? 0x2000 : 0x0000) + (py >> 1) * 80 + (px >> 3);
+                    int bit = 7 - (px & 7);
+                    uint8_t *p = &video[0x18000 + offset];
+                    if (color & 0x80) {
+                        *p ^= (1 << bit);
+                    } else if (color & 1) {
+                        *p |= (1 << bit);
+                    } else {
+                        *p &= ~(1 << bit);
+                    }
+                    s_i86.video_dirty = true;
+                    s_i86.hw.cga.needs_refresh = true;
+                }
+            }
+            return true;
+        }
+
+        case 0x0D: // Read pixel (graphics modes)
+        {
+            uint16_t px = i86_cpu_get_cx();  // CX = column
+            uint16_t py = i86_cpu_get_dx();  // DX = row
+            uint8_t color = 0;
+
+            if (s_i86.video_mode == 0x04 || s_i86.video_mode == 0x05) {
+                if (px < 320 && py < 200) {
+                    uint32_t offset = ((py & 1) ? 0x2000 : 0x0000) + (py >> 1) * 80 + (px >> 2);
+                    int shift = 6 - (px & 3) * 2;
+                    color = (video[0x18000 + offset] >> shift) & 0x03;
+                }
+            } else if (s_i86.video_mode == 0x06) {
+                if (px < 640 && py < 200) {
+                    uint32_t offset = ((py & 1) ? 0x2000 : 0x0000) + (py >> 1) * 80 + (px >> 3);
+                    int bit = 7 - (px & 7);
+                    color = (video[0x18000 + offset] >> bit) & 0x01;
+                }
+            }
+            i86_cpu_set_ax((i86_cpu_get_ax() & 0xFF00) | color);
+            return true;
+        }
+
         case 0x0E: // TTY output
             pc_putchar(al);
             return true;
@@ -684,28 +974,70 @@ static bool handle_int10h(void) {
             i86_cpu_set_bx((s_i86.active_page << 8) | (i86_cpu_get_bx() & 0xFF));
             return true;
 
-        case 0x10: // Set palette registers (VGA)
-            // Stub - return success
+        case 0x10: // VGA palette functions
+        {
+            switch (al) {
+                case 0x00: // Set individual palette register
+                case 0x01: // Set overscan (border) color
+                case 0x02: // Set all palette registers + overscan
+                case 0x03: // Toggle blink/intensity bit
+                case 0x07: // Read individual palette register
+                case 0x08: // Read overscan register
+                case 0x09: // Read all palette registers
+                    break;  // Accept silently
+                case 0x10: // Set individual DAC register
+                case 0x12: // Set block of DAC registers
+                    break;  // Accept silently
+                case 0x15: // Read individual DAC register
+                    i86_cpu_set_dx(0x0000);  // Green=0
+                    i86_cpu_set_cx(0x0000);  // Red=0, Blue=0
+                    break;
+                case 0x17: // Read block of DAC registers
+                    break;
+                case 0x1A: // Get/set DAC color page state
+                    if (bl == 0x00) {
+                        i86_cpu_set_bx(0x0000);  // Paging mode 0, page 0
+                    }
+                    break;
+                default:
+                    break;
+            }
             return true;
+        }
 
         case 0x11: // Character generator
-            // Stub - return font info
             if (al == 0x30) {
                 // Get font information
-                i86_cpu_set_cx(16);   // Bytes per character
+                uint8_t info_sel = (i86_cpu_get_bx() >> 8) & 0xFF;
+                (void)info_sel;
+                i86_cpu_set_cx(8);    // Bytes per character (CGA 8x8)
                 i86_cpu_set_dx(24);   // Rows - 1
                 i86_cpu_set_es(0xF000);
-                i86_cpu_set_bp(0xFA6E); // Font table pointer
+                i86_cpu_set_bp(0xFA6E); // Font table pointer in BIOS
             }
+            // Other sub-functions (load font, etc.) - accept silently
             return true;
 
         case 0x12: // Alternate function select
-            if ((i86_cpu_get_bx() & 0xFF) == 0x10) {
+        {
+            uint8_t bl12 = i86_cpu_get_bx() & 0xFF;
+            if (bl12 == 0x10) {
                 // Get EGA info
-                i86_cpu_set_bx(0x0003); // 256K, color
+                i86_cpu_set_bx(0x0003); // 256K, color, EGA active
                 i86_cpu_set_cx(0x0009); // Feature bits, switch settings
+            } else if (bl12 == 0x30) {
+                // Select vertical resolution (for text modes)
+                // AL=0: 200 lines, AL=1: 350, AL=2: 400
+                // Accept silently (we always use our fixed resolution)
+            } else if (bl12 == 0x34) {
+                // Cursor emulation
+                i86_cpu_set_ax(0x1200);  // Function supported
+            } else if (bl12 == 0x36) {
+                // Video refresh control
+                // AL=0: enable, AL=1: disable
             }
             return true;
+        }
 
         case 0x13: // Write string
         {
@@ -743,9 +1075,42 @@ static bool handle_int10h(void) {
         }
 
         case 0x1A: // Display combination code (VGA)
-            i86_cpu_set_ax(0x001A); // Function supported
-            i86_cpu_set_bx(0x0008); // VGA color
+            if (al == 0x00) {
+                // Get display combination
+                i86_cpu_set_ax(0x001A); // Function supported
+                i86_cpu_set_bx(0x0008); // BL=active display (VGA color), BH=alternate
+            } else {
+                // Set display combination - accept silently
+                i86_cpu_set_ax(0x001A);
+            }
             return true;
+
+        case 0x1B: // Functionality/state information
+        {
+            // Fill buffer at ES:DI with video state info
+            uint8_t *mem1b = i86_cpu_get_memory();
+            uint32_t buf1b = ((uint32_t)i86_cpu_get_es() * 16 + i86_cpu_get_di()) & 0xFFFFF;
+            // Minimal state info - 64 bytes
+            memset(mem1b + buf1b, 0, 64);
+            // Static functionality table pointer (just point to zeroes)
+            mem1b[buf1b + 0] = 0x00;  // Offset low
+            mem1b[buf1b + 1] = 0x00;  // Offset high
+            mem1b[buf1b + 2] = 0x00;  // Segment low
+            mem1b[buf1b + 3] = 0x00;  // Segment high
+            // Current video mode
+            mem1b[buf1b + 4] = s_i86.video_mode;
+            // Number of columns
+            mem1b[buf1b + 5] = 80; mem1b[buf1b + 6] = 0;
+            // Active display page
+            mem1b[buf1b + 34] = s_i86.active_page;
+            // Cursor positions
+            mem1b[buf1b + 35] = s_i86.cursor_x;
+            mem1b[buf1b + 36] = s_i86.cursor_y;
+            // Number of rows
+            mem1b[buf1b + 42] = 25;
+            i86_cpu_set_ax(0x001B);  // Function supported
+            return true;
+        }
 
         default:
             ESP_LOGD(TAG, "INT 10h AH=%02Xh (unhandled)", ah);
@@ -754,11 +1119,8 @@ static bool handle_int10h(void) {
 }
 
 static bool handle_int11h(void) {
-    // INT 11h - Equipment list
-    // Bits: 0=floppy, 1=x87, 2-3=RAM banks, 4-5=video mode, 6-7=floppies-1
-    uint16_t equip = 0x0021;  // 1 floppy, 80x25 CGA
-    if (disk_is_mounted(0)) equip |= 0x0001;
-    i86_cpu_set_ax(equip);
+    // INT 11h - Equipment list: return BDA equipment word
+    i86_cpu_set_ax(bda_read16(BDA_EQUIPMENT));
     return true;
 }
 
@@ -770,6 +1132,30 @@ static bool handle_int12h(void) {
 
 static bool handle_int13h(void) {
     // INT 13h - Disk BIOS services
+    // Log INT 13h calls: first 5 from boot sector, then first 10 from kernel
+    {
+        static int total_calls = 0;
+        static int boot_logged = 0;
+        static int kernel_logged = 0;
+        total_calls++;
+        uint16_t caller_cs = i86_cpu_get_cs();
+        bool is_boot = (caller_cs == 0x0000 || caller_cs == 0x07C0 ||
+                        caller_cs == 0x1FE0 || (caller_cs >= 0x07C0 && caller_cs <= 0x0900));
+        if (is_boot && boot_logged < 5) {
+            boot_logged++;
+            ESP_LOGI(TAG, "INT 13h boot #%d: AH=%02X DL=%02X CX=%04X from %04X:%04X",
+                     total_calls, (i86_cpu_get_ax() >> 8) & 0xFF,
+                     i86_cpu_get_dx() & 0xFF, i86_cpu_get_cx(),
+                     caller_cs, i86_cpu_get_ip());
+        } else if (!is_boot && kernel_logged < 10) {
+            kernel_logged++;
+            ESP_LOGI(TAG, "INT 13h KERNEL #%d: AH=%02X DL=%02X CX=%04X ES:BX=%04X:%04X from %04X:%04X",
+                     total_calls, (i86_cpu_get_ax() >> 8) & 0xFF,
+                     i86_cpu_get_dx() & 0xFF, i86_cpu_get_cx(),
+                     i86_cpu_get_es(), i86_cpu_get_bx(),
+                     caller_cs, i86_cpu_get_ip());
+        }
+    }
     uint8_t ah = (i86_cpu_get_ax() >> 8) & 0xFF;
     uint8_t al = i86_cpu_get_ax() & 0xFF;
     uint8_t ch = (i86_cpu_get_cx() >> 8) & 0xFF;
@@ -808,11 +1194,17 @@ static bool handle_int13h(void) {
 
                 int32_t lba = disk_chs_to_lba(drive_idx, cylinder, head, sector);
                 if (lba < 0) {
+                    ESP_LOGW(TAG, "INT13 Read: CHS=%d/%d/%d FAILED (bad CHS) drv=0x%02X",
+                             cylinder, head, sector, dl);
                     i86_cpu_set_ax(0x0400);  // Sector not found
                     set_carry(true);
                     return true;
                 }
-                uint8_t *buffer = i86_cpu_get_memory() + 16 * es + bx;
+                uint32_t phys_addr = ((uint32_t)es * 16 + bx) & 0xFFFFF;
+                uint8_t *buffer = i86_cpu_get_memory() + phys_addr;
+
+                ESP_LOGD(TAG, "INT13 Read: CHS=%d/%d/%d LBA=%d cnt=%d -> %05X drv=0x%02X",
+                         cylinder, head, sector, (int)lba, count, phys_addr, dl);
 
                 int sectors_read = disk_read_sectors(drive_idx, (uint32_t)lba, count, buffer);
                 if (sectors_read > 0) {
@@ -820,6 +1212,7 @@ static bool handle_int13h(void) {
                     s_i86.stats.disk_reads++;
                     set_carry(false);
                 } else {
+                    ESP_LOGW(TAG, "INT13 Read FAILED: LBA=%d cnt=%d", (int)lba, count);
                     i86_cpu_set_ax(0x0400);
                     set_carry(true);
                 }
@@ -844,7 +1237,8 @@ static bool handle_int13h(void) {
                     set_carry(true);
                     return true;
                 }
-                uint8_t *buffer = i86_cpu_get_memory() + 16 * es + bx;
+                uint32_t phys_addr_w = ((uint32_t)es * 16 + bx) & 0xFFFFF;
+                uint8_t *buffer = i86_cpu_get_memory() + phys_addr_w;
 
                 int sectors_written = disk_write_sectors(drive_idx, (uint32_t)lba, count, buffer);
                 if (sectors_written > 0) {
@@ -937,6 +1331,136 @@ static bool handle_int13h(void) {
             set_carry(false);
             return true;
 
+        case 0x41: // INT 13h Extensions - Check extensions present
+        {
+            if (dl >= 0x80 && i86_cpu_get_bx() == 0x55AA) {
+                // Extensions supported: fixed disk access (subset 1)
+                i86_cpu_set_ax(0x3000);  // Version 3.0
+                i86_cpu_set_bx(0xAA55);  // Signature
+                i86_cpu_set_cx(0x0001);  // Subset 1: fixed disk access
+                set_carry(false);
+            } else {
+                set_carry(true);
+            }
+            return true;
+        }
+
+        case 0x42: // INT 13h Extensions - Extended Read
+        {
+            if (dl < 0x80) {
+                set_carry(true);
+                i86_cpu_set_ax(0x0100);
+                return true;
+            }
+            // DAP (Disk Address Packet) at DS:SI
+            uint8_t *mem2 = i86_cpu_get_memory();
+            uint32_t dap_addr = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_si()) & 0xFFFFF;
+            // uint8_t dap_size = mem2[dap_addr];
+            uint16_t dap_count = mem2[dap_addr + 2] | ((uint16_t)mem2[dap_addr + 3] << 8);
+            uint16_t dap_buf_off = mem2[dap_addr + 4] | ((uint16_t)mem2[dap_addr + 5] << 8);
+            uint16_t dap_buf_seg = mem2[dap_addr + 6] | ((uint16_t)mem2[dap_addr + 7] << 8);
+            uint32_t dap_lba = mem2[dap_addr + 8] | ((uint32_t)mem2[dap_addr + 9] << 8) |
+                               ((uint32_t)mem2[dap_addr + 10] << 16) | ((uint32_t)mem2[dap_addr + 11] << 24);
+
+            uint32_t buf_phys = ((uint32_t)dap_buf_seg * 16 + dap_buf_off) & 0xFFFFF;
+            uint8_t *buf = mem2 + buf_phys;
+
+            ESP_LOGD(TAG, "INT13 ExtRead: LBA=%u cnt=%u -> %04X:%04X (%05X) drv=0x%02X",
+                     dap_lba, dap_count, dap_buf_seg, dap_buf_off, buf_phys, dl);
+
+            int sectors_read2 = disk_read_sectors(drive_idx, dap_lba, dap_count, buf);
+            if (sectors_read2 > 0) {
+                i86_cpu_set_ax(0x0000);
+                s_i86.stats.disk_reads++;
+                set_carry(false);
+            } else {
+                ESP_LOGW(TAG, "INT13 ExtRead FAILED: LBA=%u cnt=%u", dap_lba, dap_count);
+                i86_cpu_set_ax(0x0400);
+                set_carry(true);
+            }
+            return true;
+        }
+
+        case 0x43: // INT 13h Extensions - Extended Write
+        {
+            if (dl < 0x80) {
+                set_carry(true);
+                i86_cpu_set_ax(0x0100);
+                return true;
+            }
+            uint8_t *mem2 = i86_cpu_get_memory();
+            uint32_t dap_addr = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_si()) & 0xFFFFF;
+            uint16_t dap_count = mem2[dap_addr + 2] | ((uint16_t)mem2[dap_addr + 3] << 8);
+            uint16_t dap_buf_off = mem2[dap_addr + 4] | ((uint16_t)mem2[dap_addr + 5] << 8);
+            uint16_t dap_buf_seg = mem2[dap_addr + 6] | ((uint16_t)mem2[dap_addr + 7] << 8);
+            uint32_t dap_lba = mem2[dap_addr + 8] | ((uint32_t)mem2[dap_addr + 9] << 8) |
+                               ((uint32_t)mem2[dap_addr + 10] << 16) | ((uint32_t)mem2[dap_addr + 11] << 24);
+
+            uint32_t buf_phys = ((uint32_t)dap_buf_seg * 16 + dap_buf_off) & 0xFFFFF;
+            uint8_t *buf = mem2 + buf_phys;
+
+            int sectors_written2 = disk_write_sectors(drive_idx, dap_lba, dap_count, buf);
+            if (sectors_written2 > 0) {
+                i86_cpu_set_ax(0x0000);
+                s_i86.stats.disk_writes++;
+                set_carry(false);
+            } else {
+                i86_cpu_set_ax(0x0400);
+                set_carry(true);
+            }
+            return true;
+        }
+
+        case 0x48: // INT 13h Extensions - Get drive parameters
+        {
+            if (dl < 0x80) {
+                set_carry(true);
+                return true;
+            }
+            disk_info_t info2;
+            if (disk_get_info(drive_idx, &info2) == ESP_OK && info2.mounted) {
+                uint8_t *mem2 = i86_cpu_get_memory();
+                uint32_t buf_addr = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_si()) & 0xFFFFF;
+                // Result buffer size
+                mem2[buf_addr + 0] = 0x1A; mem2[buf_addr + 1] = 0x00; // Size = 26
+                // Information flags
+                mem2[buf_addr + 2] = 0x02; mem2[buf_addr + 3] = 0x00; // DMA boundary errors handled
+                // Cylinders
+                uint32_t cyls = info2.geometry.cylinders;
+                mem2[buf_addr + 4] = cyls & 0xFF;
+                mem2[buf_addr + 5] = (cyls >> 8) & 0xFF;
+                mem2[buf_addr + 6] = (cyls >> 16) & 0xFF;
+                mem2[buf_addr + 7] = (cyls >> 24) & 0xFF;
+                // Heads
+                uint32_t heads = info2.geometry.heads;
+                mem2[buf_addr + 8] = heads & 0xFF;
+                mem2[buf_addr + 9] = (heads >> 8) & 0xFF;
+                mem2[buf_addr + 10] = (heads >> 16) & 0xFF;
+                mem2[buf_addr + 11] = (heads >> 24) & 0xFF;
+                // Sectors per track
+                uint32_t spt = info2.geometry.sectors_per_track;
+                mem2[buf_addr + 12] = spt & 0xFF;
+                mem2[buf_addr + 13] = (spt >> 8) & 0xFF;
+                mem2[buf_addr + 14] = (spt >> 16) & 0xFF;
+                mem2[buf_addr + 15] = (spt >> 24) & 0xFF;
+                // Total sectors (64-bit)
+                uint32_t total = info2.geometry.total_sectors;
+                mem2[buf_addr + 16] = total & 0xFF;
+                mem2[buf_addr + 17] = (total >> 8) & 0xFF;
+                mem2[buf_addr + 18] = (total >> 16) & 0xFF;
+                mem2[buf_addr + 19] = (total >> 24) & 0xFF;
+                mem2[buf_addr + 20] = 0; mem2[buf_addr + 21] = 0;
+                mem2[buf_addr + 22] = 0; mem2[buf_addr + 23] = 0;
+                // Bytes per sector
+                mem2[buf_addr + 24] = 0x00; mem2[buf_addr + 25] = 0x02; // 512
+                i86_cpu_set_ax(0x0000);
+                set_carry(false);
+            } else {
+                set_carry(true);
+            }
+            return true;
+        }
+
         default:
             ESP_LOGD(TAG, "INT 13h AH=%02Xh (unhandled)", ah);
             i86_cpu_set_ax(0x0100);
@@ -966,9 +1490,31 @@ static bool handle_int15h(void) {
     uint8_t ah = (i86_cpu_get_ax() >> 8) & 0xFF;
 
     switch (ah) {
-        case 0x24: // A20 gate (stub)
-            set_carry(false);
+        case 0x24: // A20 gate control
+        {
+            uint8_t al_val = i86_cpu_get_ax() & 0xFF;
+            switch (al_val) {
+                case 0x00: // Disable A20
+                case 0x01: // Enable A20
+                    // We always keep A20 enabled (no gate in our emulation)
+                    set_carry(false);
+                    i86_cpu_set_ax(i86_cpu_get_ax() & 0xFF00); // AH=0 success
+                    break;
+                case 0x02: // Get A20 status
+                    set_carry(false);
+                    i86_cpu_set_ax((i86_cpu_get_ax() & 0xFF00) | 0x01); // AL=1 (enabled)
+                    break;
+                case 0x03: // Query A20 support
+                    set_carry(false);
+                    i86_cpu_set_ax(i86_cpu_get_ax() & 0xFF00);
+                    i86_cpu_set_bx(0x0003); // Keyboard controller + port 92
+                    break;
+                default:
+                    set_carry(true);
+                    break;
+            }
             return true;
+        }
 
         case 0x41: // Wait for external event
             set_carry(true);  // Function not supported
@@ -977,6 +1523,21 @@ static bool handle_int15h(void) {
         case 0x4F: // Keyboard intercept
             set_carry(true);  // Not handled, let default processing occur
             return true;
+
+        case 0x53: // APM (Advanced Power Management) - FreeDOS checks this
+        {
+            uint8_t al_val = i86_cpu_get_ax() & 0xFF;
+            if (al_val == 0x00) {
+                // APM installation check
+                i86_cpu_set_ax(0x0102); // APM version 1.2
+                i86_cpu_set_bx(0x504D); // "PM" signature
+                i86_cpu_set_cx(0x0003); // Flags: 16-bit + 32-bit
+                set_carry(false);
+            } else {
+                set_carry(true); // Not supported
+            }
+            return true;
+        }
 
         case 0x86: // Wait (microseconds in CX:DX)
         {
@@ -1020,39 +1581,47 @@ static bool handle_int16h(void) {
         case 0x00: // Wait for keypress
         case 0x10: // Enhanced wait for keypress
         {
-            // Poll for key - yield to FreeRTOS while waiting
-            int timeout = 0;
-            while (s_i86.bios_kbd_head == s_i86.bios_kbd_tail) {
+            // Poll for key using BDA keyboard buffer - no timeout.
+            while (bda_read16(BDA_KBD_HEAD) == bda_read16(BDA_KBD_TAIL)) {
                 vTaskDelay(pdMS_TO_TICKS(10));
-                poll_input();  // Actually check for new keys while waiting
-                timeout++;
+                poll_input();
+
+                // Tick hardware so timer IRQ continues firing
+                int irq_vector = pc_hw_tick(&s_i86.hw, 100);
+                if (irq_vector >= 0) {
+                    i86_cpu_irq(irq_vector);
+                }
+
                 if (s_i86.state != I86_STATE_RUNNING || s_i86.stop_requested) {
                     i86_cpu_set_ax(0);
                     return true;
                 }
-                // Poll UART and PS/2 for new keys
-                // This is done by the input polling in the main run loop
-                if (timeout > 3000) {  // 30 second timeout
-                    i86_cpu_set_ax(0);
-                    return true;
-                }
             }
-            uint16_t key = s_i86.bios_kbd_buffer[s_i86.bios_kbd_tail];
-            s_i86.bios_kbd_tail = (s_i86.bios_kbd_tail + 1) % 16;
+            // Read key from BDA buffer
+            uint16_t head = bda_read16(BDA_KBD_HEAD);
+            uint16_t key = bda_read16(0x0400 + head);
+            head += 2;
+            if (head >= 0x003E) head = 0x001E;
+            bda_write16(BDA_KBD_HEAD, head);
             i86_cpu_set_ax(key);
             return true;
         }
 
-        case 0x01: // Check for keypress
+        case 0x01: // Check for keypress (non-blocking)
         case 0x11: // Enhanced check
-            if (s_i86.bios_kbd_head != s_i86.bios_kbd_tail) {
-                i86_cpu_set_ax(s_i86.bios_kbd_buffer[s_i86.bios_kbd_tail]);
+        {
+            uint16_t head = bda_read16(BDA_KBD_HEAD);
+            uint16_t tail = bda_read16(BDA_KBD_TAIL);
+            if (head != tail) {
+                uint16_t key = bda_read16(0x0400 + head);
+                i86_cpu_set_ax(key);
                 i86_cpu_set_flag(FLAG_IDX_ZF, 0);  // Key available
             } else {
                 i86_cpu_set_ax(0x0000);
                 i86_cpu_set_flag(FLAG_IDX_ZF, 1);  // No key
             }
             return true;
+        }
 
         case 0x02: // Get shift flags
             i86_cpu_set_ax(s_i86.hw.keyboard.shift_flags);
@@ -1063,10 +1632,7 @@ static bool handle_int16h(void) {
 
         case 0x05: // Store keypress in buffer
         {
-            int next = (s_i86.bios_kbd_head + 1) % 16;
-            if (next != s_i86.bios_kbd_tail) {
-                s_i86.bios_kbd_buffer[s_i86.bios_kbd_head] = i86_cpu_get_cx();
-                s_i86.bios_kbd_head = next;
+            if (bda_kbd_push(i86_cpu_get_cx())) {
                 i86_cpu_set_ax(0x0000);  // Success
             } else {
                 i86_cpu_set_ax(0x0100);  // Buffer full
@@ -1104,8 +1670,10 @@ static bool handle_int19h(void) {
                     ESP_LOGI(TAG, "Booting from drive %d (0x%02X)",
                              i, i < 2 ? i : 0x80 + (i - 2));
 
-                    console_printf("Booting from %s...\n",
-                                   i < 2 ? "floppy" : "hard disk");
+                    // Use printf (UART only) - not console_printf which would
+                    // switch video card back to TEXT mode
+                    printf("Booting from %s...\n",
+                           i < 2 ? "floppy" : "hard disk");
 
                     // INT 19h does NOT return via IRET.
                     // The CPU core calls our callback BEFORE pushing anything
@@ -1145,8 +1713,8 @@ static bool handle_int19h(void) {
     }
 
     ESP_LOGW(TAG, "No bootable disk found");
-    console_printf("No bootable disk found.\n");
-    console_printf("Use 'mount A <image.img>' to mount a boot disk.\n");
+    printf("No bootable disk found.\n");
+    printf("Use 'mount A <image.img>' to mount a boot disk.\n");
     s_i86.state = I86_STATE_HALTED;
     return true;
 }
@@ -1156,16 +1724,31 @@ static bool handle_int1ah(void) {
     uint8_t ah = (i86_cpu_get_ax() >> 8) & 0xFF;
 
     switch (ah) {
-        case 0x00: // Get tick count
-            i86_cpu_set_cx((s_i86.timer_ticks >> 16) & 0xFFFF);
-            i86_cpu_set_dx(s_i86.timer_ticks & 0xFFFF);
-            i86_cpu_set_ax(s_i86.timer_midnight ? 1 : 0);
-            s_i86.timer_midnight = false;
+        case 0x00: // Get tick count - read from BDA (authoritative source)
+        {
+            uint8_t *mem = i86_cpu_get_memory();
+            uint32_t ticks = mem[BDA_TIMER_COUNT] |
+                             ((uint32_t)mem[BDA_TIMER_COUNT + 1] << 8) |
+                             ((uint32_t)mem[BDA_TIMER_COUNT + 2] << 16) |
+                             ((uint32_t)mem[BDA_TIMER_COUNT + 3] << 24);
+            i86_cpu_set_cx((ticks >> 16) & 0xFFFF);
+            i86_cpu_set_dx(ticks & 0xFFFF);
+            uint8_t midnight = mem[BDA_TIMER_OFLOW];
+            i86_cpu_set_ax(midnight ? 1 : 0);
+            mem[BDA_TIMER_OFLOW] = 0;  // Clear midnight flag after read
             return true;
+        }
 
-        case 0x01: // Set tick count
-            s_i86.timer_ticks = ((uint32_t)i86_cpu_get_cx() << 16) | i86_cpu_get_dx();
+        case 0x01: // Set tick count - write to BDA
+        {
+            uint8_t *mem = i86_cpu_get_memory();
+            uint32_t ticks = ((uint32_t)i86_cpu_get_cx() << 16) | i86_cpu_get_dx();
+            mem[BDA_TIMER_COUNT]     = ticks & 0xFF;
+            mem[BDA_TIMER_COUNT + 1] = (ticks >> 8) & 0xFF;
+            mem[BDA_TIMER_COUNT + 2] = (ticks >> 16) & 0xFF;
+            mem[BDA_TIMER_COUNT + 3] = (ticks >> 24) & 0xFF;
             return true;
+        }
 
         case 0x02: // Get RTC time
         {
@@ -1217,6 +1800,51 @@ static bool handle_int21h(void) {
 
     s_i86.stats.dos_calls++;
 
+    // Log first 10 non-overlay INT 21h calls to trace kernel boot sequence
+    {
+        static int dos_call_log = 0;
+        bool is_4b_al03 = (ah == 0x4B && al == 0x03);
+        if (dos_call_log < 10 && !is_4b_al03) {
+            // Get caller CS:IP from the stack (the INT pushed flags, CS, IP)
+            // But since callback fires BEFORE IVT dispatch, CS:IP are still current
+            uint16_t caller_cs = i86_cpu_get_cs();
+            uint16_t caller_ip = i86_cpu_get_ip();
+            ESP_LOGI(TAG, "DOS21 #%d: AH=%02X AL=%02X from %04X:%04X DS=%04X DX=%04X",
+                     dos_call_log, ah, al, caller_cs, caller_ip,
+                     i86_cpu_get_ds(), i86_cpu_get_dx());
+            // For AH=25h (set vector), log the target
+            if (ah == 0x25) {
+                ESP_LOGI(TAG, "  SET VEC %02Xh -> %04X:%04X",
+                         al, i86_cpu_get_ds(), i86_cpu_get_dx());
+            }
+            // For AH=4Bh (EXEC), dump detailed info
+            if (ah == 0x4B) {
+                uint8_t *emem = i86_cpu_get_memory();
+                uint32_t fname_phys = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_dx()) & 0xFFFFF;
+                uint32_t pb_phys = ((uint32_t)i86_cpu_get_es() * 16 + i86_cpu_get_bx()) & 0xFFFFF;
+                uint32_t code_phys = ((uint32_t)caller_cs * 16 + caller_ip) & 0xFFFFF;
+                ESP_LOGI(TAG, "  EXEC AL=%02X ES:BX=%04X:%04X (pb@%05X) DS:DX=%04X:%04X (fn@%05X)",
+                         al, i86_cpu_get_es(), i86_cpu_get_bx(), pb_phys,
+                         i86_cpu_get_ds(), i86_cpu_get_dx(), fname_phys);
+                ESP_LOGI(TAG, "  Filename bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                         emem[fname_phys+0], emem[fname_phys+1], emem[fname_phys+2], emem[fname_phys+3],
+                         emem[fname_phys+4], emem[fname_phys+5], emem[fname_phys+6], emem[fname_phys+7],
+                         emem[fname_phys+8], emem[fname_phys+9], emem[fname_phys+10], emem[fname_phys+11],
+                         emem[fname_phys+12], emem[fname_phys+13], emem[fname_phys+14], emem[fname_phys+15]);
+                ESP_LOGI(TAG, "  ParamBlk bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                         emem[pb_phys+0], emem[pb_phys+1], emem[pb_phys+2], emem[pb_phys+3],
+                         emem[pb_phys+4], emem[pb_phys+5], emem[pb_phys+6], emem[pb_phys+7],
+                         emem[pb_phys+8], emem[pb_phys+9], emem[pb_phys+10], emem[pb_phys+11],
+                         emem[pb_phys+12], emem[pb_phys+13]);
+                ESP_LOGI(TAG, "  Code @%05X: %02X %02X %02X %02X %02X %02X %02X %02X",
+                         code_phys,
+                         emem[code_phys+0], emem[code_phys+1], emem[code_phys+2], emem[code_phys+3],
+                         emem[code_phys+4], emem[code_phys+5], emem[code_phys+6], emem[code_phys+7]);
+            }
+            dos_call_log++;
+        }
+    }
+
     switch (ah) {
         case 0x00: // Terminate program
             s_i86.state = I86_STATE_HALTED;
@@ -1225,16 +1853,15 @@ static bool handle_int21h(void) {
 
         case 0x01: // Read character with echo
         {
-            // Wait for key from BIOS buffer
-            while (s_i86.bios_kbd_head == s_i86.bios_kbd_tail) {
+            uint16_t key;
+            while (!bda_kbd_pop(&key)) {
                 vTaskDelay(pdMS_TO_TICKS(10));
+                poll_input();
                 if (s_i86.state != I86_STATE_RUNNING || s_i86.stop_requested) {
                     i86_cpu_set_ax(0);
                     return true;
                 }
             }
-            uint16_t key = s_i86.bios_kbd_buffer[s_i86.bios_kbd_tail];
-            s_i86.bios_kbd_tail = (s_i86.bios_kbd_tail + 1) % 16;
             uint8_t ch = key & 0xFF;
             pc_putchar(ch);  // Echo
             i86_cpu_set_ax((ah << 8) | ch);
@@ -1248,9 +1875,8 @@ static bool handle_int21h(void) {
         case 0x06: // Direct console I/O
             if ((i86_cpu_get_dx() & 0xFF) == 0xFF) {
                 // Input
-                if (s_i86.bios_kbd_head != s_i86.bios_kbd_tail) {
-                    uint16_t key = s_i86.bios_kbd_buffer[s_i86.bios_kbd_tail];
-                    s_i86.bios_kbd_tail = (s_i86.bios_kbd_tail + 1) % 16;
+                uint16_t key;
+                if (bda_kbd_pop(&key)) {
                     i86_cpu_set_ax((ah << 8) | (key & 0xFF));
                     i86_cpu_set_flag(FLAG_IDX_ZF, 0);  // Key available
                 } else {
@@ -1266,12 +1892,12 @@ static bool handle_int21h(void) {
         case 0x07: // Direct char input without echo
         case 0x08: // Char input without echo
         {
-            while (s_i86.bios_kbd_head == s_i86.bios_kbd_tail) {
+            uint16_t key;
+            while (!bda_kbd_pop(&key)) {
                 vTaskDelay(pdMS_TO_TICKS(10));
+                poll_input();
                 if (s_i86.state != I86_STATE_RUNNING || s_i86.stop_requested) return true;
             }
-            uint16_t key = s_i86.bios_kbd_buffer[s_i86.bios_kbd_tail];
-            s_i86.bios_kbd_tail = (s_i86.bios_kbd_tail + 1) % 16;
             i86_cpu_set_ax((ah << 8) | (key & 0xFF));
             return true;
         }
@@ -1289,21 +1915,21 @@ static bool handle_int21h(void) {
         case 0x0A: // Buffered input
         {
             uint8_t *mem = i86_cpu_get_memory();
-            uint32_t buf_addr = 16 * i86_cpu_get_ds() + i86_cpu_get_dx();
+            uint32_t buf_addr = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_dx()) & 0xFFFFF;
             uint8_t max_len = mem[buf_addr];
             uint8_t pos = 0;
 
             while (pos < max_len - 1) {
-                while (s_i86.bios_kbd_head == s_i86.bios_kbd_tail) {
+                uint16_t key;
+                while (!bda_kbd_pop(&key)) {
                     vTaskDelay(pdMS_TO_TICKS(10));
+                    poll_input();
                     if (s_i86.state != I86_STATE_RUNNING || s_i86.stop_requested) {
                         mem[buf_addr + 1] = pos;
                         mem[buf_addr + 2 + pos] = '\r';
                         return true;
                     }
                 }
-                uint16_t key = s_i86.bios_kbd_buffer[s_i86.bios_kbd_tail];
-                s_i86.bios_kbd_tail = (s_i86.bios_kbd_tail + 1) % 16;
                 uint8_t ch = key & 0xFF;
 
                 if (ch == '\r' || ch == '\n') {
@@ -1329,7 +1955,7 @@ static bool handle_int21h(void) {
         }
 
         case 0x0B: // Check standard input status
-            if (s_i86.bios_kbd_head != s_i86.bios_kbd_tail) {
+            if (!bda_kbd_empty()) {
                 i86_cpu_set_ax(0x0BFF);
             } else {
                 i86_cpu_set_ax(0x0B00);
@@ -1337,8 +1963,7 @@ static bool handle_int21h(void) {
             return true;
 
         case 0x0C: // Clear keyboard buffer and invoke input function
-            s_i86.bios_kbd_head = 0;
-            s_i86.bios_kbd_tail = 0;
+            bda_kbd_flush();
             // Fall through to input function specified in AL
             if (al == 0x01 || al == 0x06 || al == 0x07 || al == 0x08 || al == 0x0A) {
                 i86_cpu_set_ax((al << 8) | (i86_cpu_get_ax() & 0xFF));
@@ -1367,6 +1992,21 @@ static bool handle_int21h(void) {
             s_i86.dos.dta_offset = i86_cpu_get_dx();
             return true;
 
+        case 0x1B: // Get allocation info for default drive
+        case 0x1C: // Get allocation info for specific drive
+        {
+            // Return fake drive info: 64 sectors/cluster, 512 bytes/sector
+            i86_cpu_set_ax(64);     // Sectors per cluster
+            i86_cpu_set_cx(512);    // Bytes per sector
+            i86_cpu_set_dx(20000);  // Total clusters
+            // DS:BX should point to media ID byte - use a byte in BDA area
+            uint8_t *mem1b = i86_cpu_get_memory();
+            mem1b[0x0504] = 0xF8;  // Hard disk media ID
+            i86_cpu_set_ds(0x0050);
+            i86_cpu_set_bx(0x0004);
+            return true;
+        }
+
         case 0x25: // Set interrupt vector
         {
             uint8_t vec = al;
@@ -1379,6 +2019,93 @@ static bool handle_int21h(void) {
             mem[vec * 4 + 3] = (new_seg >> 8) & 0xFF;
             return true;
         }
+
+        case 0x26: // Create new PSP
+        {
+            // Copy current PSP (256 bytes) to segment in DX
+            uint8_t *mem26 = i86_cpu_get_memory();
+            uint16_t new_psp_seg = i86_cpu_get_dx();
+            uint32_t src_addr = (uint32_t)s_i86.dos.psp_segment * 16;
+            uint32_t dst_addr = (uint32_t)new_psp_seg * 16;
+            if (src_addr + 256 <= I8086_TOTAL_MEMORY && dst_addr + 256 <= I8086_TOTAL_MEMORY) {
+                memcpy(mem26 + dst_addr, mem26 + src_addr, 256);
+                // Update INT 22h (terminate addr) in new PSP
+                mem26[dst_addr + 0x0A] = i86_cpu_get_ip() & 0xFF;
+                mem26[dst_addr + 0x0B] = (i86_cpu_get_ip() >> 8) & 0xFF;
+                mem26[dst_addr + 0x0C] = i86_cpu_get_cs() & 0xFF;
+                mem26[dst_addr + 0x0D] = (i86_cpu_get_cs() >> 8) & 0xFF;
+            }
+            return true;
+        }
+
+        case 0x29: // Parse filename into FCB
+        {
+            uint8_t *mem29 = i86_cpu_get_memory();
+            uint32_t src29 = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_si()) & 0xFFFFF;
+            uint32_t dst29 = ((uint32_t)i86_cpu_get_es() * 16 + i86_cpu_get_di()) & 0xFFFFF;
+
+            // Skip leading separators if AL bit 0 set
+            int pos = 0;
+            if (al & 0x01) {
+                while (mem29[src29 + pos] == ' ' || mem29[src29 + pos] == '\t') pos++;
+            }
+
+            // Initialize FCB with blanks
+            mem29[dst29 + 0] = 0;  // Drive number (0=default)
+            memset(mem29 + dst29 + 1, ' ', 11);  // Filename + extension
+
+            // Check for drive letter
+            if (mem29[src29 + pos + 1] == ':') {
+                uint8_t drv = toupper(mem29[src29 + pos]) - 'A' + 1;
+                mem29[dst29 + 0] = drv;
+                pos += 2;
+            }
+
+            // Parse filename (up to 8 chars)
+            int fn_pos = 0;
+            while (fn_pos < 8 && mem29[src29 + pos] != '.' &&
+                   mem29[src29 + pos] != ' ' && mem29[src29 + pos] != '\0' &&
+                   mem29[src29 + pos] != '\r' && mem29[src29 + pos] != '/' &&
+                   mem29[src29 + pos] != '\\') {
+                if (mem29[src29 + pos] == '*') {
+                    while (fn_pos < 8) mem29[dst29 + 1 + fn_pos++] = '?';
+                } else {
+                    mem29[dst29 + 1 + fn_pos++] = toupper(mem29[src29 + pos]);
+                }
+                pos++;
+            }
+
+            // Parse extension
+            if (mem29[src29 + pos] == '.') {
+                pos++;
+                int ext_pos = 0;
+                while (ext_pos < 3 && mem29[src29 + pos] != ' ' &&
+                       mem29[src29 + pos] != '\0' && mem29[src29 + pos] != '\r') {
+                    if (mem29[src29 + pos] == '*') {
+                        while (ext_pos < 3) mem29[dst29 + 9 + ext_pos++] = '?';
+                    } else {
+                        mem29[dst29 + 9 + ext_pos++] = toupper(mem29[src29 + pos]);
+                    }
+                    pos++;
+                }
+            }
+
+            // Update SI to point past parsed name
+            i86_cpu_set_si((i86_cpu_get_si() + pos) & 0xFFFF);
+
+            // AL return: 0=no wildcards, 1=wildcards found
+            bool has_wild = false;
+            for (int w = 1; w <= 11; w++) {
+                if (mem29[dst29 + w] == '?') { has_wild = true; break; }
+            }
+            i86_cpu_set_ax((ah << 8) | (has_wild ? 0x01 : 0x00));
+            return true;
+        }
+
+        case 0x2F: // Get DTA address
+            i86_cpu_set_es(s_i86.dos.dta_segment);
+            i86_cpu_set_bx(s_i86.dos.dta_offset);
+            return true;
 
         case 0x2A: // Get date
         {
@@ -1442,6 +2169,81 @@ static bool handle_int21h(void) {
             i86_cpu_set_bx(10000);  // Available clusters
             i86_cpu_set_cx(512);    // Bytes per sector
             i86_cpu_set_dx(20000);  // Total clusters
+            return true;
+        }
+
+        case 0x34: // Get address of InDOS flag
+        {
+            // Place InDOS flag at a fixed location in BIOS area (0x0050:0x0010 = phys 0x510)
+            uint8_t *mem34 = i86_cpu_get_memory();
+            mem34[0x510] = 0x00;  // Not in DOS
+            i86_cpu_set_es(0x0050);
+            i86_cpu_set_bx(0x0010);
+            return true;
+        }
+
+        case 0x38: // Get/set country info
+        {
+            if (al == 0x00 || al == 0x01) {
+                // Get country info - fill buffer at DS:DX
+                uint8_t *mem38 = i86_cpu_get_memory();
+                uint32_t buf38 = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_dx()) & 0xFFFFF;
+                memset(mem38 + buf38, 0, 34);
+                // Date format: 0=USA (m/d/y)
+                mem38[buf38 + 0] = 0x00; mem38[buf38 + 1] = 0x00;
+                // Currency symbol "$\0\0\0\0"
+                mem38[buf38 + 2] = '$'; mem38[buf38 + 3] = 0;
+                // Thousands separator ","
+                mem38[buf38 + 7] = ','; mem38[buf38 + 8] = 0;
+                // Decimal separator "."
+                mem38[buf38 + 9] = '.'; mem38[buf38 + 10] = 0;
+                // Date separator "/"
+                mem38[buf38 + 11] = '/'; mem38[buf38 + 12] = 0;
+                // Time separator ":"
+                mem38[buf38 + 13] = ':'; mem38[buf38 + 14] = 0;
+                // Currency format: 0 = $1.23
+                mem38[buf38 + 15] = 0x00;
+                // Digits after decimal in currency
+                mem38[buf38 + 16] = 0x02;
+                // Time format: 0 = 12-hour
+                mem38[buf38 + 17] = 0x00;
+                i86_cpu_set_bx(0x0001);  // Country code = 1 (US)
+                set_carry(false);
+            } else {
+                set_carry(true);
+            }
+            return true;
+        }
+
+        case 0x39: // Create directory (MKDIR)
+        {
+            char dos_path39[DOS_PATH_MAX];
+            read_dos_string(i86_cpu_get_ds(), i86_cpu_get_dx(), dos_path39, sizeof(dos_path39), '\0');
+            char vfs_path39[DOS_PATH_MAX];
+            dos_to_vfs_path(dos_path39, vfs_path39, sizeof(vfs_path39));
+
+            if (mkdir(vfs_path39, 0755) == 0) {
+                set_carry(false);
+            } else {
+                i86_cpu_set_ax(0x03);  // Path not found
+                set_carry(true);
+            }
+            return true;
+        }
+
+        case 0x3A: // Remove directory (RMDIR)
+        {
+            char dos_path3a[DOS_PATH_MAX];
+            read_dos_string(i86_cpu_get_ds(), i86_cpu_get_dx(), dos_path3a, sizeof(dos_path3a), '\0');
+            char vfs_path3a[DOS_PATH_MAX];
+            dos_to_vfs_path(dos_path3a, vfs_path3a, sizeof(vfs_path3a));
+
+            if (rmdir(vfs_path3a) == 0) {
+                set_carry(false);
+            } else {
+                i86_cpu_set_ax(0x03);
+                set_carry(true);
+            }
             return true;
         }
 
@@ -1566,16 +2368,16 @@ static bool handle_int21h(void) {
                 // Read from STDIN (keyboard)
                 uint16_t read_count = 0;
                 while (read_count < count) {
-                    while (s_i86.bios_kbd_head == s_i86.bios_kbd_tail) {
+                    uint16_t key;
+                    while (!bda_kbd_pop(&key)) {
                         vTaskDelay(pdMS_TO_TICKS(10));
+                        poll_input();
                         if (s_i86.state != I86_STATE_RUNNING || s_i86.stop_requested) {
                             i86_cpu_set_ax(read_count);
                             set_carry(false);
                             return true;
                         }
                     }
-                    uint16_t key = s_i86.bios_kbd_buffer[s_i86.bios_kbd_tail];
-                    s_i86.bios_kbd_tail = (s_i86.bios_kbd_tail + 1) % 16;
                     uint8_t ch = key & 0xFF;
                     mem[buf_addr + read_count] = ch;
                     read_count++;
@@ -1716,6 +2518,64 @@ static bool handle_int21h(void) {
             return true;
         }
 
+        case 0x45: // Duplicate file handle
+        {
+            uint16_t src_handle = i86_cpu_get_bx();
+            if (src_handle < DOS_FIRST_HANDLE) {
+                // Standard handles - return next available handle pointing to same device
+                int new_handle = dos_find_free_handle();
+                if (new_handle < 0) {
+                    i86_cpu_set_ax(0x04);
+                    set_carry(true);
+                } else {
+                    s_i86.dos.files[new_handle].open = true;
+                    s_i86.dos.files[new_handle].fp = NULL;  // Device handle
+                    s_i86.dos.files[new_handle].access_mode = 2;
+                    i86_cpu_set_ax(new_handle);
+                    set_carry(false);
+                }
+            } else if (src_handle < DOS_MAX_FILES && s_i86.dos.files[src_handle].open) {
+                int new_handle = dos_find_free_handle();
+                if (new_handle < 0) {
+                    i86_cpu_set_ax(0x04);
+                    set_carry(true);
+                } else {
+                    // Duplicate: share the same FILE* (not a true dup, but sufficient)
+                    s_i86.dos.files[new_handle] = s_i86.dos.files[src_handle];
+                    i86_cpu_set_ax(new_handle);
+                    set_carry(false);
+                }
+            } else {
+                i86_cpu_set_ax(0x06);
+                set_carry(true);
+            }
+            return true;
+        }
+
+        case 0x46: // Force duplicate file handle
+        {
+            uint16_t src46 = i86_cpu_get_bx();
+            uint16_t dst46 = i86_cpu_get_cx();
+            if (dst46 < DOS_MAX_FILES) {
+                // Close destination if open
+                if (s_i86.dos.files[dst46].open && s_i86.dos.files[dst46].fp) {
+                    fclose(s_i86.dos.files[dst46].fp);
+                }
+                if (src46 < DOS_FIRST_HANDLE) {
+                    s_i86.dos.files[dst46].open = true;
+                    s_i86.dos.files[dst46].fp = NULL;
+                    s_i86.dos.files[dst46].access_mode = 2;
+                } else if (src46 < DOS_MAX_FILES && s_i86.dos.files[src46].open) {
+                    s_i86.dos.files[dst46] = s_i86.dos.files[src46];
+                }
+                set_carry(false);
+            } else {
+                i86_cpu_set_ax(0x06);
+                set_carry(true);
+            }
+            return true;
+        }
+
         case 0x47: // Get current directory
         {
             // Write directory path to DS:SI
@@ -1745,6 +2605,126 @@ static bool handle_int21h(void) {
         case 0x4A: // Resize memory block
             set_carry(false);
             return true;
+
+        case 0x4B: // EXEC / Load and Execute Program
+        {
+            uint8_t *emem4b = i86_cpu_get_memory();
+            uint32_t fname_phys = ((uint32_t)i86_cpu_get_ds() * 16 + i86_cpu_get_dx()) & 0xFFFFF;
+            uint32_t pb_phys4b = ((uint32_t)i86_cpu_get_es() * 16 + i86_cpu_get_bx()) & 0xFFFFF;
+
+            if (al == 0x03) {
+                // AL=3: Load Overlay - FreeDOS kernel scans 100+ overlay entries during init.
+                // Return SUCCESS (CF=0, AX=0) to acknowledge each entry.
+                static int exec_al03_count = 0;
+                exec_al03_count++;
+                if (exec_al03_count <= 3 || exec_al03_count % 50 == 0) {
+                    ESP_LOGI(TAG, "INT21 4B AL=03 overlay scan #%d (suppressing repeats)", exec_al03_count);
+                }
+                i86_cpu_set_ax(0x0000);
+                set_carry(false);
+                return true;
+            }
+
+            // For AL != 03: log all details
+            bool fname_ok = (emem4b[fname_phys] >= 0x20 && emem4b[fname_phys] < 0x80);
+            char fname4b[128] = { 0 };
+            if (fname_ok) {
+                read_dos_string(i86_cpu_get_ds(), i86_cpu_get_dx(), fname4b, sizeof(fname4b), '\0');
+            }
+
+            uint16_t load_seg = 0;
+            bool pb_valid = (pb_phys4b < 0xA0000);
+            if (pb_valid) {
+                load_seg = emem4b[pb_phys4b] | ((uint16_t)emem4b[pb_phys4b + 1] << 8);
+            }
+
+            static int exec_call_count = 0;
+            exec_call_count++;
+            ESP_LOGI(TAG, "INT21 4B #%d: AL=%02X fname='%s' (ok=%d) ES:BX=%04X:%04X pb_valid=%d load_seg=%04X",
+                     exec_call_count, al, fname_ok ? fname4b : "GARBAGE",
+                     fname_ok, i86_cpu_get_es(), i86_cpu_get_bx(), pb_valid, load_seg);
+
+            // Dump first 16 bytes at load segment
+            if (pb_valid && load_seg != 0) {
+                uint32_t ls_phys = (uint32_t)load_seg * 16;
+                if (ls_phys < 0xA0000) {
+                    ESP_LOGI(TAG, "  load_seg %04X:0000 (%05X): %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                             load_seg, ls_phys,
+                             emem4b[ls_phys+0], emem4b[ls_phys+1], emem4b[ls_phys+2], emem4b[ls_phys+3],
+                             emem4b[ls_phys+4], emem4b[ls_phys+5], emem4b[ls_phys+6], emem4b[ls_phys+7],
+                             emem4b[ls_phys+8], emem4b[ls_phys+9], emem4b[ls_phys+10], emem4b[ls_phys+11],
+                             emem4b[ls_phys+12], emem4b[ls_phys+13], emem4b[ls_phys+14], emem4b[ls_phys+15]);
+                }
+            }
+
+            if (al == 0x00 && fname_ok) {
+                // AL=0: Load and Execute - try to load the file from VFS
+                char vfs_path4b[DOS_PATH_MAX];
+                dos_to_vfs_path(fname4b, vfs_path4b, sizeof(vfs_path4b));
+                FILE *f4b = fopen(vfs_path4b, "rb");
+                if (!f4b) {
+                    ESP_LOGI(TAG, "  -> AL=0 EXEC: file not found: '%s'", vfs_path4b);
+                    i86_cpu_set_ax(0x0002);
+                    set_carry(true);
+                    return true;
+                }
+                // Get file size and load address
+                fseek(f4b, 0, SEEK_END);
+                long fsize4b = ftell(f4b);
+                fseek(f4b, 0, SEEK_SET);
+                // For AL=0, parameter block: ES:BX -> env_seg(2), cmd_ptr(4), fcb1(4), fcb2(4)
+                // Load the program using a minimal PSP at some free memory address
+                // For now, load at a fixed location just above DOS area (~0x2000:0000)
+                uint32_t prog_phys = 0x20000;  // 128KB mark - above kernel low area
+                if (pb_valid && load_seg != 0 && (uint32_t)load_seg * 16 < 0x90000) {
+                    prog_phys = (uint32_t)load_seg * 16;
+                }
+                if (prog_phys + fsize4b > 0x9F000) {
+                    ESP_LOGW(TAG, "  -> AL=0 EXEC: program too large (%ld bytes)", fsize4b);
+                    fclose(f4b);
+                    i86_cpu_set_ax(0x0008);  // Insufficient memory
+                    set_carry(true);
+                    return true;
+                }
+                size_t rd4b = fread(emem4b + prog_phys, 1, fsize4b, f4b);
+                fclose(f4b);
+                ESP_LOGI(TAG, "  -> AL=0 EXEC: loaded '%s' (%ld bytes) at %05X", vfs_path4b, fsize4b, prog_phys);
+                // Set CS:IP to program entry point (0x100 for COM, or from EXE header)
+                uint16_t prog_seg = (uint16_t)(prog_phys >> 4);
+                if (emem4b[prog_phys] == 'M' && emem4b[prog_phys+1] == 'Z') {
+                    // EXE file: read header
+                    uint16_t ip = emem4b[prog_phys+20] | ((uint16_t)emem4b[prog_phys+21] << 8);
+                    uint16_t cs = emem4b[prog_phys+22] | ((uint16_t)emem4b[prog_phys+23] << 8);
+                    uint16_t sp = emem4b[prog_phys+16] | ((uint16_t)emem4b[prog_phys+17] << 8);
+                    uint16_t ss = emem4b[prog_phys+14] | ((uint16_t)emem4b[prog_phys+15] << 8);
+                    i86_cpu_set_cs(prog_seg + cs);
+                    i86_cpu_set_ip(ip);
+                    i86_cpu_set_ss(prog_seg + ss);
+                    i86_cpu_set_sp(sp);
+                    ESP_LOGI(TAG, "    EXE: CS:IP=%04X:%04X SS:SP=%04X:%04X", prog_seg+cs, ip, prog_seg+ss, sp);
+                } else {
+                    // COM file: CS=DS=ES=SS = prog_seg+0x10 (PSP prefix), IP=0x100
+                    uint16_t com_seg = prog_seg - 0x10;  // PSP before COM
+                    i86_cpu_set_cs(com_seg);
+                    i86_cpu_set_ip(0x0100);
+                    i86_cpu_set_ss(com_seg);
+                    i86_cpu_set_sp(0xFFFE);
+                    i86_cpu_set_ds(com_seg);
+                    i86_cpu_set_es(com_seg);
+                    ESP_LOGI(TAG, "    COM: CS=DS=SS=%04X IP=0100", com_seg);
+                }
+                i86_cpu_set_ax(0x0000);
+                set_carry(false);
+                // Note: returning true with modified CS:IP causes CPU to start executing the program
+                return true;
+            } else {
+                // AL=0 with garbage filename, or other AL value
+                ESP_LOGI(TAG, "  -> AL=%02X bad/unsupported: returning file-not-found", al);
+                i86_cpu_set_ax(0x0002);
+                set_carry(true);
+                return true;
+            }
+        }
 
         case 0x4C: // Terminate with return code
             s_i86.dos.return_code = al;
@@ -1884,6 +2864,15 @@ static bool handle_int21h(void) {
             i86_cpu_set_bx(s_i86.dos.psp_segment);
             return true;
 
+        case 0x52: // Get List of Lists (SYSVARS)
+        {
+            // Return pointer to minimal LoL structure at 0x0060:0x0000 (phys 0x600)
+            // Set up in setup_bios()
+            i86_cpu_set_es(0x0060);
+            i86_cpu_set_bx(0x0000);
+            return true;
+        }
+
         case 0x56: // Rename file
         {
             char old_dos[DOS_PATH_MAX], new_dos[DOS_PATH_MAX];
@@ -1923,6 +2912,119 @@ static bool handle_int21h(void) {
             set_carry(false);
             return true;
 
+        case 0x5B: // Create new file (fail if exists)
+        {
+            char dos_path5b[DOS_PATH_MAX];
+            read_dos_string(i86_cpu_get_ds(), i86_cpu_get_dx(), dos_path5b, sizeof(dos_path5b), '\0');
+            char vfs_path5b[DOS_PATH_MAX];
+            dos_to_vfs_path(dos_path5b, vfs_path5b, sizeof(vfs_path5b));
+
+            // Check if file already exists
+            struct stat st5b;
+            if (stat(vfs_path5b, &st5b) == 0) {
+                i86_cpu_set_ax(0x50);  // File exists
+                set_carry(true);
+                return true;
+            }
+
+            int handle5b = dos_find_free_handle();
+            if (handle5b < 0) {
+                i86_cpu_set_ax(0x04);
+                set_carry(true);
+                return true;
+            }
+
+            FILE *fp5b = fopen(vfs_path5b, "w+b");
+            if (!fp5b) {
+                i86_cpu_set_ax(0x03);
+                set_carry(true);
+                return true;
+            }
+
+            s_i86.dos.files[handle5b].fp = fp5b;
+            s_i86.dos.files[handle5b].open = true;
+            s_i86.dos.files[handle5b].access_mode = 2;
+            strncpy(s_i86.dos.files[handle5b].path, vfs_path5b, DOS_PATH_MAX - 1);
+            s_i86.stats.files_opened++;
+            i86_cpu_set_ax(handle5b);
+            set_carry(false);
+            return true;
+        }
+
+        case 0x60: // Get canonical filename (truename)
+        {
+            char dos_path60[DOS_PATH_MAX];
+            read_dos_string(i86_cpu_get_ds(), i86_cpu_get_si(), dos_path60, sizeof(dos_path60), '\0');
+
+            // Build canonical path: prepend drive letter if missing
+            char canon[DOS_PATH_MAX + 4];  // Extra space for "C:\\" prefix
+            if (dos_path60[1] == ':') {
+                // Already has drive letter
+                snprintf(canon, sizeof(canon), "%s", dos_path60);
+            } else if (dos_path60[0] == '\\') {
+                snprintf(canon, sizeof(canon), "C:%s", dos_path60);
+            } else {
+                snprintf(canon, sizeof(canon), "C:\\%s", dos_path60);
+            }
+            // Uppercase
+            for (int i = 0; canon[i]; i++) {
+                canon[i] = toupper((unsigned char)canon[i]);
+            }
+            write_dos_string(i86_cpu_get_es(), i86_cpu_get_di(), canon);
+            set_carry(false);
+            return true;
+        }
+
+        case 0x65: // Get extended country information
+        {
+            if (al == 0x01) {
+                // Get general internationalization info
+                uint8_t *mem65 = i86_cpu_get_memory();
+                uint32_t buf65 = ((uint32_t)i86_cpu_get_es() * 16 + i86_cpu_get_di()) & 0xFFFFF;
+                uint16_t size65 = i86_cpu_get_cx();
+                if (size65 > 41) size65 = 41;
+                memset(mem65 + buf65, 0, size65);
+                mem65[buf65 + 0] = 0x01;  // Info ID
+                if (size65 >= 3) { mem65[buf65 + 1] = 38; mem65[buf65 + 2] = 0; } // Size
+                if (size65 >= 5) { mem65[buf65 + 3] = 0x01; mem65[buf65 + 4] = 0x00; } // Country=1 (US)
+                if (size65 >= 7) { mem65[buf65 + 5] = 0xB5; mem65[buf65 + 6] = 0x01; } // Codepage=437
+                if (size65 >= 9) { mem65[buf65 + 7] = 0x00; mem65[buf65 + 8] = 0x00; } // Date format=MDY
+                if (size65 >= 14) { mem65[buf65 + 9] = '$'; } // Currency symbol
+                if (size65 >= 16) { mem65[buf65 + 14] = ','; } // Thousands separator
+                if (size65 >= 18) { mem65[buf65 + 16] = '.'; } // Decimal separator
+                i86_cpu_set_cx(size65);
+                set_carry(false);
+            } else {
+                set_carry(true);
+            }
+            return true;
+        }
+
+        case 0x66: // Get/set global code page
+            if (al == 0x01) {
+                // Get code page
+                i86_cpu_set_bx(437);  // Active code page (US)
+                i86_cpu_set_dx(437);  // System code page
+            }
+            set_carry(false);
+            return true;
+
+        case 0x67: // Set handle count
+            // Accept and ignore - we always support DOS_MAX_FILES
+            set_carry(false);
+            return true;
+
+        case 0x68: // Commit file (flush)
+        {
+            uint16_t handle68 = i86_cpu_get_bx();
+            if (handle68 < DOS_MAX_FILES && s_i86.dos.files[handle68].open &&
+                s_i86.dos.files[handle68].fp) {
+                fflush(s_i86.dos.files[handle68].fp);
+            }
+            set_carry(false);
+            return true;
+        }
+
         default:
             ESP_LOGD(TAG, "INT 21h AH=%02Xh (unhandled)", ah);
             set_carry(true);
@@ -1934,36 +3036,274 @@ static bool handle_int21h(void) {
 // Main Interrupt Dispatcher
 // ============================================================================
 
+// BIOS IVT signature: each handled interrupt gets a unique BIOS ROM address.
+// Format: IVT entry points to F000:E0xx where xx = interrupt number.
+// At that ROM address we place an IRET. The callback checks if the IVT
+// still points to our BIOS address; if the guest OS has overridden it,
+// we return false so the CPU dispatches through the IVT instead.
+#define BIOS_IVT_SEG  0xF000
+#define BIOS_IVT_STUB_BASE 0xE000  // F000:E000 + i*4, 4 bytes per stub
+#define BIOS_INT08_HANDLER 0xE400  // INT 08h real x86 code (25 bytes)
+#define BIOS_BOOT_CODE     0xE420  // INT 19h bootstrap code
+#define BIOS_HD_TABLE      0xE440  // Hard disk parameter table
+
+static bool ivt_is_bios_default(uint8_t num) {
+    uint8_t *mem = i86_cpu_get_memory();
+    // uint16_t vec_off = mem[num * 4 + 0] | (mem[num * 4 + 1] << 8);
+    uint16_t vec_seg = mem[num * 4 + 2] | (mem[num * 4 + 3] << 8);
+    // Check if vector still points to our BIOS ROM area (F000:xxxx)
+    return (vec_seg == BIOS_IVT_SEG);
+}
+
+// Diagnostic counters for interrupt tracking
+static uint32_t s_int08_count = 0;  // Timer ticks
+static uint32_t s_int09_count = 0;  // Keyboard
+static uint32_t s_int10_count = 0;  // Video
+static uint32_t s_int13_count = 0;  // Disk
+static uint32_t s_int21_count = 0;  // DOS
+
 static bool i86_interrupt_handler(void *ctx, uint8_t num) {
     s_i86.stats.interrupts_processed++;
+    // Count interrupts by type
+    switch (num) {
+        case 0x08: s_int08_count++; break;
+        case 0x09: s_int09_count++; break;
+        case 0x10: s_int10_count++; break;
+        case 0x13: s_int13_count++; break;
+        case 0x21: s_int21_count++; break;
+    }
 
-    // Debug: Log important interrupts from boot sector
-    if (num == 0x10 || num == 0x13 || num == 0x16) {
-        uint8_t ah = (i86_cpu_get_ax() >> 8) & 0xFF;
-        ESP_LOGI(TAG, "INT %02Xh AH=%02Xh", num, ah);
+    // Detect IVT hooks (one-time log when key interrupts are redirected)
+    {
+        static bool ivt_hook_logged[256] = {false};
+        if (!ivt_hook_logged[num] && (num == 0x08 || num == 0x09 ||
+            num == 0x10 || num == 0x13 || num == 0x16 || num == 0x19 ||
+            num == 0x21 || num == 0x29 || num == 0x2F)) {
+            if (!ivt_is_bios_default(num)) {
+                uint8_t *mem = i86_cpu_get_memory();
+                uint16_t seg = mem[num*4+2] | (mem[num*4+3] << 8);
+                uint16_t off = mem[num*4+0] | (mem[num*4+1] << 8);
+                ESP_LOGI(TAG, "IVT HOOK: INT %02Xh -> %04X:%04X (was F000:BIOS)",
+                         num, seg, off);
+                ivt_hook_logged[num] = true;
+            }
+        }
+    }
+
+    // Log first 300 non-timer non-console INTs from all code segments
+    // Exclude boot sector (CS=0x1FE0 after reloc, CS=0x07C0 before reloc),
+    // BIOS (CS >= 0xF000), and noise interrupts (08h=timer, 29h=console, 1Ch=tick)
+    {
+        static int kernel_int_count = 0;
+        uint16_t caller_cs = i86_cpu_get_cs();
+        uint16_t kint_ax = i86_cpu_get_ax();
+        uint8_t kint_ah = (kint_ax >> 8) & 0xFF;
+        uint8_t kint_al = kint_ax & 0xFF;
+        // Exclude boot sector segments and BIOS segment
+        bool is_boot_sector = (caller_cs == 0x1FE0 || caller_cs == 0x07C0 || caller_cs == 0x0000);
+        // Exclude INT 21h 4B AL=03 overlay scan spam (100+ identical calls during kernel init)
+        bool is_4b_overlay_scan = (num == 0x21 && kint_ah == 0x4B && kint_al == 0x03);
+        // Exclude INT 03h - FreeDOS uses it as an internal memory-management hook (loops 200+ times)
+        bool is_int3_hook = (num == 0x03);
+        // Exclude INT 01h - FreeDOS uses it as single-step/debug hook (loops 300+ times loading COMMAND.COM)
+        bool is_int1_hook = (num == 0x01);
+        if (!is_boot_sector && caller_cs < 0xF000 &&
+            num != 0x08 && num != 0x29 && num != 0x1C &&
+            !is_4b_overlay_scan && !is_int3_hook && !is_int1_hook &&
+            kernel_int_count < 300) {
+            kernel_int_count++;
+            ESP_LOGI(TAG, "KINT #%d: INT %02Xh AH=%02X from %04X:%04X",
+                     kernel_int_count, num, kint_ah,
+                     caller_cs, i86_cpu_get_ip());
+        }
+    }
+
+    // Monitor INT 21h IVT vector for changes - check on EVERY interrupt
+    // (kernel may hook and unhook between timer ticks)
+    {
+        static uint16_t prev_int21_seg = 0xFFFF;  // Init to impossible value
+        static uint16_t prev_int21_off = 0xFFFF;
+        static int ivt_changes = 0;
+        uint8_t *mem_chk = i86_cpu_get_memory();
+        uint16_t cur_off = mem_chk[0x84] | (mem_chk[0x85] << 8);
+        uint16_t cur_seg = mem_chk[0x86] | (mem_chk[0x87] << 8);
+        if (cur_seg != prev_int21_seg || cur_off != prev_int21_off) {
+            if (ivt_changes < 20) {
+                ESP_LOGI(TAG, "INT21 VEC CHANGED: %04X:%04X -> %04X:%04X (INT %02Xh, tick %lu)",
+                         prev_int21_seg, prev_int21_off, cur_seg, cur_off,
+                         num, (unsigned long)s_int08_count);
+                ivt_changes++;
+            }
+            prev_int21_seg = cur_seg;
+            prev_int21_off = cur_off;
+        }
     }
 
     switch (num) {
-        case 0x08: return handle_int08h();
-        case 0x09: return handle_int09h();
-        case 0x10: return handle_int10h();
-        case 0x11: return handle_int11h();
-        case 0x12: return handle_int12h();
-        case 0x13: return handle_int13h();
-        case 0x14: return handle_int14h();
-        case 0x15: return handle_int15h();
-        case 0x16: return handle_int16h();
-        case 0x17: return handle_int17h();
-        case 0x19: return handle_int19h();
-        case 0x1A: return handle_int1ah();
-        case 0x21: return handle_int21h();
-        case 0x28: return true;  // DOS idle interrupt
-        case 0x2F: return true;  // Multiplex interrupt (stub)
+        // CPU exceptions - log for debugging
+        case 0x00: { // Divide error
+            // x86: INT 0 is raised with IP pointing to the faulting DIV instruction.
+            // An IRET from the IVT handler returns to the DIV again → infinite loop.
+            // Fix: compute the DIV instruction length, advance IP past it, and set
+            // quotient=0 (AX) and remainder=0 (DX) as a safe divide-by-zero result.
+            uint8_t *mem_d0 = i86_cpu_get_memory();
+            uint16_t flt_cs = i86_cpu_get_cs();
+            uint16_t flt_ip = i86_cpu_get_ip();
+            uint32_t phys_d0 = ((uint32_t)flt_cs * 16 + flt_ip) & 0xFFFFF;
+            uint8_t opcode_d0 = mem_d0[phys_d0];       // F6 (byte) or F7 (word)
+            uint8_t modrm_d0  = mem_d0[phys_d0 + 1];   // ModRM byte
+            uint8_t mod_d0    = (modrm_d0 >> 6) & 3;
+            uint8_t rm_d0     = modrm_d0 & 7;
+            // DIV instruction length: 2 (opcode + ModRM) + optional displacement
+            int inst_len_d0 = 2;
+            if (mod_d0 == 0 && rm_d0 == 6) inst_len_d0 += 2;  // direct 16-bit address
+            else if (mod_d0 == 1)           inst_len_d0 += 1;  // 8-bit displacement
+            else if (mod_d0 == 2)           inst_len_d0 += 2;  // 16-bit displacement
+            // Skip past the faulting instruction
+            i86_cpu_set_ip(flt_ip + inst_len_d0);
+            // Set quotient=0 (AX) and remainder=0 (DX) as safe result
+            i86_cpu_set_ax(0);
+            i86_cpu_set_dx(0);
+            static int div0_count = 0;
+            if (div0_count++ < 10) {
+                ESP_LOGE(TAG, "DIV0 at %04X:%04X op=%02X ModRM=%02X len=%d → skip, AX=DX=0",
+                         flt_cs, flt_ip, opcode_d0, modrm_d0, inst_len_d0);
+            }
+            return true; // Handled: don't dispatch through IVT (avoids infinite re-execution)
+        }
+        case 0x01: { // Single-step / debug trap
+            // FreeDOS uses INT 01h as a single-step hook when loading COMMAND.COM.
+            // IVT[1] may be set to a bad address (zeros in BIOS ROM) by FreeDOS init code.
+            // Always handle here (= IRET) to prevent the CPU jumping to zero-filled ROM.
+            static int int1_count = 0;
+            int1_count++;
+            if (int1_count <= 3 || int1_count % 1000 == 0) {
+                ESP_LOGI(TAG, "INT 01h #%d: AH=%02X from %04X:%04X IVT=%04X:%04X",
+                         int1_count, (i86_cpu_get_ax() >> 8) & 0xFF,
+                         i86_cpu_get_cs(), i86_cpu_get_ip(),
+                         ((uint16_t*)i86_cpu_get_memory())[3],   // IVT[1] CS
+                         ((uint16_t*)i86_cpu_get_memory())[2]);  // IVT[1] IP
+            }
+            return true; // IRET immediately - don't dispatch to potentially bad IVT[1]
+        }
+        case 0x03: { // Breakpoint - FreeDOS uses this as internal memory-management hook
+            static int int3_count = 0;
+            int3_count++;
+            if (int3_count <= 3 || int3_count % 1000 == 0) {
+                ESP_LOGI(TAG, "INT 03h #%d: AH=%02X from %04X:%04X (FreeDOS hook)",
+                         int3_count, (i86_cpu_get_ax() >> 8) & 0xFF,
+                         i86_cpu_get_cs(), i86_cpu_get_ip());
+            }
+            return false; // Let IVT[3] handler run (default BIOS stub = IRET)
+        }
+        case 0x06: { // Invalid opcode
+            static int ud_count = 0;
+            if (ud_count++ < 5) {
+                uint8_t *mem = i86_cpu_get_memory();
+                uint32_t phys = ((uint32_t)i86_cpu_get_cs() * 16 + i86_cpu_get_ip()) & 0xFFFFF;
+                ESP_LOGE(TAG, "Invalid opcode at %04X:%04X [%02X %02X %02X %02X]",
+                         i86_cpu_get_cs(), i86_cpu_get_ip(),
+                         mem[phys], mem[phys+1], mem[phys+2], mem[phys+3]);
+            }
+            return false;
+        }
+
+        // Hardware IRQ handlers - handle only if IVT still points to BIOS.
+        // Once the guest OS hooks these, let CPU dispatch through IVT.
+        // The guest OS chains back to F000:E0xx (real x86 code) for
+        // the actual hardware handling (BDA update, EOI, etc).
+        case 0x08: if (ivt_is_bios_default(num)) return handle_int08h(); return false;
+        case 0x09: if (ivt_is_bios_default(num)) return handle_int09h(); return false;
+
+        // BIOS service interrupts - handle if IVT is default, otherwise let
+        // kernel's handler run first (it chains to F000:E0xx which has
+        // trampoline code that triggers 0xE0-0xEA callbacks below).
+        case 0x10: if (ivt_is_bios_default(num)) return handle_int10h(); return false;
+        case 0x11: if (ivt_is_bios_default(num)) return handle_int11h(); return false;
+        case 0x12: if (ivt_is_bios_default(num)) return handle_int12h(); return false;
+        case 0x13: if (ivt_is_bios_default(num)) return handle_int13h(); return false;
+        case 0x14: if (ivt_is_bios_default(num)) return handle_int14h(); return false;
+        case 0x15: if (ivt_is_bios_default(num)) return handle_int15h(); return false;
+        case 0x16: if (ivt_is_bios_default(num)) return handle_int16h(); return false;
+        case 0x17: if (ivt_is_bios_default(num)) return handle_int17h(); return false;
+        case 0x19: return handle_int19h();  // Bootstrap - always handle
+        case 0x1A: if (ivt_is_bios_default(num)) return handle_int1ah(); return false;
+        case 0x1C: if (ivt_is_bios_default(num)) return true; return false;
+
+        // BIOS ROM trampoline handlers: triggered when kernel chains to
+        // F000:E0xx and the trampoline INT 0xE0+N fires. These always
+        // execute the actual BIOS service regardless of IVT state.
+        case 0xE0: return handle_int10h();  // Video (from INT 10h chain)
+        case 0xE1: return handle_int11h();  // Equipment
+        case 0xE2: return handle_int12h();  // Memory size
+        case 0xE3: return handle_int13h();  // Disk
+        case 0xE4: return handle_int14h();  // Serial
+        case 0xE5: return handle_int15h();  // System services
+        case 0xE6: return handle_int16h();  // Keyboard
+        case 0xE7: return handle_int17h();  // Printer
+        case 0xE9: {                        // Fast console output (from INT 29h chain)
+            pc_putchar(i86_cpu_get_ax() & 0xFF);
+            return true;
+        }
+        case 0xEA: return handle_int1ah();  // RTC
+
+        // INT 29h - DOS Fast Console Output (character in AL)
+        // Gate by IVT: if kernel installed its own handler, let it run
+        // (kernel's handler calls INT 10h which we always handle)
+        case 0x29: {
+            if (!ivt_is_bios_default(num)) {
+                // Kernel has its own INT 29h handler - let it run
+                return false;
+            }
+            // Before kernel installs handler, we provide the service
+            uint8_t ch = i86_cpu_get_ax() & 0xFF;
+            pc_putchar(ch);
+            return true;
+        }
+
+        // DOS service interrupts - handle only if IVT is default (before DOS loads)
+        case 0x20: // DOS terminate
+            if (ivt_is_bios_default(num)) { s_i86.state = I86_STATE_HALTED; return true; }
+            return false;
+        case 0x21: {
+            static int int21_dispatch_log = 0;
+            bool is_default = ivt_is_bios_default(num);
+            uint16_t d21_ax = i86_cpu_get_ax();
+            bool d21_is_4b_al03 = (((d21_ax>>8)&0xFF) == 0x4B && (d21_ax&0xFF) == 0x03);
+            if (int21_dispatch_log < 20 && !d21_is_4b_al03) {
+                uint8_t *mem21d = i86_cpu_get_memory();
+                uint16_t vec21_off = mem21d[0x84] | (mem21d[0x85] << 8);
+                uint16_t vec21_seg = mem21d[0x86] | (mem21d[0x87] << 8);
+                ESP_LOGI(TAG, "INT21 dispatch #%d: AH=%02X default=%d vec=%04X:%04X from %04X:%04X",
+                         int21_dispatch_log,
+                         (d21_ax >> 8) & 0xFF,
+                         is_default, vec21_seg, vec21_off,
+                         i86_cpu_get_cs(), i86_cpu_get_ip());
+                int21_dispatch_log++;
+            }
+            if (is_default) return handle_int21h();
+            return false;
+        }
+        case 0x28: // DOS idle
+            if (ivt_is_bios_default(num)) return true;
+            return false;
+        case 0x2F: // Multiplex
+            if (ivt_is_bios_default(num)) return true;
+            return false;
+
         default:
-            if (num < 0x08 || num > 0x0F) {
-                ESP_LOGD(TAG, "INT %02Xh (unhandled)", num);
+        {
+            // Log unexpected/unhandled interrupts during boot (first 50)
+            static int unhandled_count = 0;
+            if (unhandled_count < 50) {
+                uint16_t cs = i86_cpu_get_cs();
+                uint16_t ip = i86_cpu_get_ip();
+                ESP_LOGD(TAG, "Unhandled INT %02Xh from %04X:%04X AX=%04X",
+                         num, cs, ip, i86_cpu_get_ax());
+                unhandled_count++;
             }
             return false;  // Let CPU handle via IVT
+        }
     }
 }
 
@@ -1974,40 +3314,157 @@ static bool i86_interrupt_handler(void *ctx, uint8_t num) {
 static void setup_bios(void) {
     uint8_t *mem = i86_cpu_get_memory();
 
-    // Clear conventional memory
-    memset(mem, 0, 0x500);  // Clear IVT + BDA
+    // Clear IVT + BDA area
+    memset(mem, 0, 0x500);
 
-    // Set up IVT - all vectors point to IRET at F000:FF00
+    // Clear BIOS ROM area (F0000-FFFFF)
+    memset(mem + 0xF0000, 0, 0x10000);
+
+    // =====================================================================
+    // Set up IVT with distinct per-interrupt BIOS ROM addresses
+    // Each vector points to F000:(E000 + i*4), 4 bytes per stub
+    // This allows ivt_is_bios_default() to work and provides distinct stubs
+    // with enough room for 3-byte trampolines (INT xx; IRET)
+    // =====================================================================
     for (int i = 0; i < 256; i++) {
-        mem[i * 4 + 0] = 0x00;  // Offset low
-        mem[i * 4 + 1] = 0xFF;  // Offset high
-        mem[i * 4 + 2] = 0x00;  // Segment low
+        uint16_t offset = BIOS_IVT_STUB_BASE + i * 4;  // F000:E000+i*4
+        mem[i * 4 + 0] = offset & 0xFF;
+        mem[i * 4 + 1] = (offset >> 8) & 0xFF;
+        mem[i * 4 + 2] = 0x00;  // Segment low (F000)
         mem[i * 4 + 3] = 0xF0;  // Segment high
+
+        uint32_t stub_addr = 0xF0000 + offset;
+        // For BIOS service interrupts (10h-17h, 1Ah, 29h), place a trampoline:
+        //   INT trampoline_num; IRET
+        // When kernel chains to our BIOS ROM stub, the INT triggers our callback.
+        // Trampoline mapping: INT 10h→0xE0, 11h→0xE1, ..., 17h→0xE7, 1Ah→0xEA, 29h→0xE9
+        uint8_t trampoline = 0;
+        if (i >= 0x10 && i <= 0x17) trampoline = 0xE0 + (i - 0x10);
+        else if (i == 0x1A) trampoline = 0xEA;
+        else if (i == 0x29) trampoline = 0xE9;
+
+        if (trampoline) {
+            mem[stub_addr + 0] = 0xCD;          // INT imm8
+            mem[stub_addr + 1] = trampoline;
+            mem[stub_addr + 2] = 0xCF;          // IRET
+        } else {
+            mem[stub_addr] = 0xCF;  // IRET only
+        }
     }
 
-    // IRET instruction at F000:FF00
-    mem[0xFFF00] = 0xCF;  // IRET
+    // Override INT 08h IVT to point to real x86 handler (separate area)
+    {
+        uint16_t offset = BIOS_INT08_HANDLER;
+        mem[0x08 * 4 + 0] = offset & 0xFF;
+        mem[0x08 * 4 + 1] = (offset >> 8) & 0xFF;
+        // Segment already set to F000
+    }
 
-    // --- BIOS Data Area (BDA) setup ---
+    // Also place IRET at the old catch-all address F000:FF00
+    mem[0xFFF00] = 0xCF;
 
-    // Equipment word: 1 floppy drive, 80x25 CGA video
-    bda_write16(BDA_EQUIPMENT, 0x0021);
+    // =====================================================================
+    // INT 08h - Timer tick handler (real x86 code, chainable)
+    // Must be real code because FreeDOS hooks INT 08h and chains back.
+    // When chaining via CALL FAR, the callback won't fire.
+    // F000:E400 (physical 0xFE400), 25 bytes
+    // =====================================================================
+    {
+        uint32_t a = 0xF0000 + BIOS_INT08_HANDLER;
+        int p = 0;
+        // PUSH DS
+        mem[a + p++] = 0x1E;
+        // PUSH AX
+        mem[a + p++] = 0x50;
+        // MOV AX, 0040h
+        mem[a + p++] = 0xB8; mem[a + p++] = 0x40; mem[a + p++] = 0x00;
+        // MOV DS, AX
+        mem[a + p++] = 0x8E; mem[a + p++] = 0xD8;
+        // INC WORD PTR [006Ch] (BDA timer low word)
+        mem[a + p++] = 0xFF; mem[a + p++] = 0x06;
+        mem[a + p++] = 0x6C; mem[a + p++] = 0x00;
+        // JNZ +4 (skip high word increment)
+        mem[a + p++] = 0x75; mem[a + p++] = 0x04;
+        // INC WORD PTR [006Eh] (BDA timer high word)
+        mem[a + p++] = 0xFF; mem[a + p++] = 0x06;
+        mem[a + p++] = 0x6E; mem[a + p++] = 0x00;
+        // INT 1Ch (user timer tick hook)
+        mem[a + p++] = 0xCD; mem[a + p++] = 0x1C;
+        // MOV AL, 20h (EOI command)
+        mem[a + p++] = 0xB0; mem[a + p++] = 0x20;
+        // OUT 20h, AL (send EOI to PIC)
+        mem[a + p++] = 0xE6; mem[a + p++] = 0x20;
+        // POP AX
+        mem[a + p++] = 0x58;
+        // POP DS
+        mem[a + p++] = 0x1F;
+        // IRET
+        mem[a + p++] = 0xCF;
+        ESP_LOGD(TAG, "INT 08h handler at %05Xh, %d bytes", a, p);
+    }
 
-    // Memory size
+    // =====================================================================
+    // INT 1Eh - Diskette Parameter Table (data, not code)
+    // Place at F000:EFC0 (physical 0xFEFC0), 11 bytes
+    // =====================================================================
+    {
+        uint32_t dpt_addr = 0xFEFC0;
+        mem[dpt_addr + 0] = 0xDF;  // SRT=D, HUT=F (step rate, head unload)
+        mem[dpt_addr + 1] = 0x02;  // HLT=01, DMA=yes
+        mem[dpt_addr + 2] = 0x25;  // Motor off delay (ticks)
+        mem[dpt_addr + 3] = 0x02;  // Bytes per sector: 512 (N=2)
+        mem[dpt_addr + 4] = 18;    // Sectors per track (1.44M)
+        mem[dpt_addr + 5] = 0x1B;  // Gap length
+        mem[dpt_addr + 6] = 0xFF;  // Data length
+        mem[dpt_addr + 7] = 0x54;  // Format gap length
+        mem[dpt_addr + 8] = 0xF6;  // Format fill byte
+        mem[dpt_addr + 9] = 0x0F;  // Head settle time (ms)
+        mem[dpt_addr + 10] = 0x08; // Motor start time (1/8 sec units)
+        // Point INT 1Eh to this table
+        mem[0x1E * 4 + 0] = 0xC0;  // Offset = EFC0
+        mem[0x1E * 4 + 1] = 0xEF;
+        mem[0x1E * 4 + 2] = 0x00;  // Segment = F000
+        mem[0x1E * 4 + 3] = 0xF0;
+    }
+
+    // =====================================================================
+    // BIOS Data Area (BDA) at 0x0400-0x04FF
+    // =====================================================================
+
+    // COM port base addresses
+    bda_write16(BDA_COM1, 0x03F8);
+    bda_write16(BDA_COM2, 0x02F8);
+
+    // LPT port base addresses
+    bda_write16(BDA_LPT1, 0x0378);
+
+    // Equipment word: 1 floppy, 80x25 CGA color, no FPU
+    // Bits: 0=has floppy, 1=FPU, 4-5=video (10=80x25 color), 6-7=floppies-1
+    bda_write16(BDA_EQUIPMENT, 0x0061);  // 80x25 CGA color (bits 4-5 = 10)
+
+    // Memory size in KB
     bda_write16(BDA_MEMORY_SIZE, 640);
 
-    // Keyboard buffer: empty, head = tail = 0x41E
+    // Keyboard buffer: head and tail are ABSOLUTE offsets from seg 0040
+    // Buffer is at 0040:001E to 0040:003D (0x41E to 0x43D)
     bda_write16(BDA_KBD_HEAD, 0x001E);
     bda_write16(BDA_KBD_TAIL, 0x001E);
 
-    // Video mode 03h (80x25 color text)
+    // Keyboard flags
+    bda_write8(BDA_KBD_FLAGS1, 0x00);
+    bda_write8(BDA_KBD_FLAGS2, 0x00);
+
+    // Video: mode 03h (80x25 color text)
     bda_write8(BDA_VIDEO_MODE, 0x03);
     bda_write16(BDA_VIDEO_COLS, 80);
     bda_write16(BDA_VIDEO_PAGE_SIZE, 4096);
     bda_write16(BDA_VIDEO_PAGE_OFF, 0);
-    bda_write16(BDA_CURSOR_TYPE, 0x0607);  // Cursor: start 6, end 7
+    bda_write16(BDA_CURSOR_TYPE, 0x0607);
     bda_write8(BDA_ACTIVE_PAGE, 0);
     bda_write16(BDA_CRTC_PORT, 0x03D4);
+
+    // Number of video rows - 1 (at 0x0484, used by DOS)
+    mem[0x0484] = 24;
 
     // Timer ticks (start from 0)
     bda_write16(BDA_TIMER_COUNT, 0);
@@ -2020,59 +3477,121 @@ static void setup_bios(void) {
     if (disk_is_mounted(3)) hd_count++;
     bda_write8(BDA_DISK_COUNT, hd_count);
 
-    // BIOS ROM area (F0000-FFFFF)
-    // Entry point at FFFF:0000 → JMP F000:E05B
-    mem[0xFFFF0] = 0xEA;  // JMP FAR
-    mem[0xFFFF1] = 0x5B;  // Offset low
-    mem[0xFFFF2] = 0xE0;  // Offset high
-    mem[0xFFFF3] = 0x00;  // Segment low
-    mem[0xFFFF4] = 0xF0;  // Segment high
+    // Print timeout values
+    bda_write8(BDA_PRINT_TIMEOUT, 20);
+    bda_write8(BDA_PRINT_TIMEOUT + 1, 20);
 
-    // Boot code at F000:E05B - invoke INT 19h then halt
-    mem[0xFE05B] = 0xCD;  // INT 19h
-    mem[0xFE05C] = 0x19;
-    mem[0xFE05D] = 0xF4;  // HLT
-    mem[0xFE05E] = 0xEB;  // JMP $-2
-    mem[0xFE05F] = 0xFC;
+    // =====================================================================
+    // BIOS ROM Entry Points
+    // =====================================================================
+
+    // Power-on entry: FFFF:0000 → JMP FAR F000:E420
+    mem[0xFFFF0] = 0xEA;
+    mem[0xFFFF1] = (BIOS_BOOT_CODE) & 0xFF;
+    mem[0xFFFF2] = (BIOS_BOOT_CODE >> 8) & 0xFF;
+    mem[0xFFFF3] = 0x00;
+    mem[0xFFFF4] = 0xF0;
+
+    // Boot code at F000:E420: INT 19h then halt
+    {
+        uint32_t bc = 0xF0000 + BIOS_BOOT_CODE;
+        mem[bc + 0] = 0xCD;  // INT 19h
+        mem[bc + 1] = 0x19;
+        mem[bc + 2] = 0xF4;  // HLT
+        mem[bc + 3] = 0xEB;  // JMP $-2
+        mem[bc + 4] = 0xFC;
+    }
 
     // BIOS date string at FFFF:0005
-    const char *bios_date = "02/07/26";
+    const char *bios_date = "02/13/26";
     memcpy(mem + 0xFFFF5, bios_date, 8);
 
     // Machine ID at FFFF:000E
-    mem[0xFFFFE] = 0xFC;  // AT class machine
+    mem[0xFFFFE] = 0xFC;  // AT class
 
-    // Set up hard disk parameter tables
-    // INT 41h vector → HD0 parameters at F000:E401
+    // =====================================================================
+    // Hard Disk Parameter Tables
+    // =====================================================================
     if (disk_is_mounted(2)) {
         disk_info_t info;
         if (disk_get_info(2, &info) == ESP_OK) {
-            uint32_t table_addr = 0xFE401;
-            // Hard disk parameter table format
+            uint32_t table_addr = 0xF0000 + BIOS_HD_TABLE;
             mem[table_addr + 0] = info.geometry.cylinders & 0xFF;
             mem[table_addr + 1] = (info.geometry.cylinders >> 8) & 0xFF;
             mem[table_addr + 2] = info.geometry.heads;
-            mem[table_addr + 5] = 0xFF;  // Write precompensation (none)
+            mem[table_addr + 5] = 0xFF;
             mem[table_addr + 6] = 0xFF;
-            mem[table_addr + 8] = 0x00;  // Control byte
+            mem[table_addr + 8] = 0x00;
             mem[table_addr + 14] = info.geometry.sectors_per_track;
 
-            // Point INT 41h to this table
-            mem[0x41 * 4 + 0] = 0x01;  // Offset = E401
-            mem[0x41 * 4 + 1] = 0xE4;
-            mem[0x41 * 4 + 2] = 0x00;  // Segment = F000
+            // INT 41h → HD0 parameter table
+            mem[0x41 * 4 + 0] = (BIOS_HD_TABLE) & 0xFF;
+            mem[0x41 * 4 + 1] = (BIOS_HD_TABLE >> 8) & 0xFF;
+            mem[0x41 * 4 + 2] = 0x00;
             mem[0x41 * 4 + 3] = 0xF0;
         }
     }
 
+    // =====================================================================
+    // Program PIT channel 0 for ~18.2 Hz (reload = 0 = 65536)
+    // This mimics what the BIOS does during POST
+    // =====================================================================
+    pc_hw_write_port(&s_i86.hw, 0x43, 0x36);  // Ch0, LSB/MSB, mode 3 (square wave)
+    pc_hw_write_port(&s_i86.hw, 0x40, 0x00);  // Reload low byte (0 = 65536)
+    pc_hw_write_port(&s_i86.hw, 0x40, 0x00);  // Reload high byte
+
+    // Unmask timer and keyboard IRQs on PIC
+    pc_hw_write_port(&s_i86.hw, 0x21, 0xFC);  // Mask = 1111_1100 → unmask IRQ0+IRQ1
+
+    // =====================================================================
     // Clear video RAM (B8000-B8FFF = 80x25 text mode)
+    // =====================================================================
     uint8_t *video = mem + 0xB8000;
     for (int i = 0; i < 4000; i += 2) {
-        video[i] = 0x20;      // Space
-        video[i + 1] = 0x07;  // Light gray on black
+        video[i] = 0x20;
+        video[i + 1] = 0x07;
     }
 
-    ESP_LOGI(TAG, "BIOS initialized: IVT, BDA, BIOS ROM, video RAM");
+    // =====================================================================
+    // DOS List of Lists (LoL) structure at 0060:0000 (physical 0x600)
+    // INT 21h/52h returns ES:BX pointing here. Minimal structure to
+    // prevent crashes when FreeDOS or programs inspect it.
+    // =====================================================================
+    {
+        uint32_t lol = 0x600;
+        memset(mem + lol - 2, 0, 0x30);
+        // Offset -2: First MCB segment (0x0080 = just above PSP area)
+        mem[lol - 2] = 0x80; mem[lol - 1] = 0x00;
+        // Offset +0: First DPB pointer (FFFF:FFFF = none)
+        mem[lol + 0] = 0xFF; mem[lol + 1] = 0xFF;
+        mem[lol + 2] = 0xFF; mem[lol + 3] = 0xFF;
+        // Offset +4: First SFT pointer (FFFF:FFFF = none)
+        mem[lol + 4] = 0xFF; mem[lol + 5] = 0xFF;
+        mem[lol + 6] = 0xFF; mem[lol + 7] = 0xFF;
+        // Offset +8: CLOCK$ device (FFFF:FFFF = none)
+        mem[lol + 8] = 0xFF; mem[lol + 9] = 0xFF;
+        mem[lol + 10] = 0xFF; mem[lol + 11] = 0xFF;
+        // Offset +12: CON device (FFFF:FFFF = none)
+        mem[lol + 12] = 0xFF; mem[lol + 13] = 0xFF;
+        mem[lol + 14] = 0xFF; mem[lol + 15] = 0xFF;
+        // Offset +16: Max bytes per sector
+        mem[lol + 16] = 0x00; mem[lol + 17] = 0x02;  // 512
+        // Offset +18: First disk buffer pointer (FFFF:FFFF)
+        mem[lol + 18] = 0xFF; mem[lol + 19] = 0xFF;
+        mem[lol + 20] = 0xFF; mem[lol + 21] = 0xFF;
+        // Offset +22h (34): NUL device header at the LoL + 0x22
+        // NUL device: next device = FFFF:FFFF, attributes = 0x8004 (char device, NUL)
+        uint32_t nul = lol + 0x22;
+        mem[nul + 0] = 0xFF; mem[nul + 1] = 0xFF;  // Next: FFFF:FFFF
+        mem[nul + 2] = 0xFF; mem[nul + 3] = 0xFF;
+        mem[nul + 4] = 0x04; mem[nul + 5] = 0x80;  // Attr: char device, NUL
+        mem[nul + 6] = 0x00; mem[nul + 7] = 0x00;  // Strategy entry (stub)
+        mem[nul + 8] = 0x00; mem[nul + 9] = 0x00;  // Interrupt entry (stub)
+        // Device name "NUL     "
+        memcpy(mem + nul + 10, "NUL     ", 8);
+    }
+
+    ESP_LOGI(TAG, "BIOS initialized: IVT (distinct entries), BDA, BIOS ROM, PIT, video RAM, LoL");
 }
 
 // ============================================================================
@@ -2088,17 +3607,23 @@ static void poll_input(void) {
         // Push scancode to keyboard controller (triggers IRQ 1)
         kbd_push_scancode(&s_i86.hw.keyboard, scancode);
 
-        // Also add directly to BIOS keyboard buffer
-        int next = (s_i86.bios_kbd_head + 1) % 16;
-        if (next != s_i86.bios_kbd_tail) {
-            s_i86.bios_kbd_buffer[s_i86.bios_kbd_head] = (scancode << 8) | ascii;
-            s_i86.bios_kbd_head = next;
+        // Also add directly to BDA keyboard buffer
+        bda_kbd_push((scancode << 8) | ascii);
+    }
+
+    // Check USB keyboard
+    if (usb_keyboard_is_initialized()) {
+        while (usb_keyboard_available()) {
+            uint8_t ascii = usb_keyboard_read();
+            uint8_t scancode = (ascii < 128) ? ascii_to_scancode[ascii] : 0;
+            if (scancode) {
+                kbd_push_scancode(&s_i86.hw.keyboard, scancode);
+                bda_kbd_push((scancode << 8) | ascii);
+            }
         }
     }
 
     // Check UART (truly non-blocking via UART driver)
-    // Note: fgetc(stdin) BLOCKS and cannot be used here since the
-    // emulator runs in a separate task from the console REPL.
     {
         size_t buffered = 0;
         uart_get_buffered_data_len(CONFIG_ESP_CONSOLE_UART_NUM, &buffered);
@@ -2108,15 +3633,8 @@ static void poll_input(void) {
                 uint8_t ascii = byte;
                 uint8_t scancode = (ascii < 128) ? ascii_to_scancode[ascii] : 0;
 
-                // Push to keyboard controller
                 kbd_push_scancode(&s_i86.hw.keyboard, scancode);
-
-                // Add to BIOS keyboard buffer
-                int next = (s_i86.bios_kbd_head + 1) % 16;
-                if (next != s_i86.bios_kbd_tail) {
-                    s_i86.bios_kbd_buffer[s_i86.bios_kbd_head] = (scancode << 8) | ascii;
-                    s_i86.bios_kbd_head = next;
-                }
+                bda_kbd_push((scancode << 8) | ascii);
             }
         }
     }
@@ -2133,15 +3651,51 @@ static void refresh_lcd(void) {
     int64_t now = esp_timer_get_time();
     if (now - s_i86.last_refresh_us < 33333) return;  // 30 FPS max
     s_i86.last_refresh_us = now;
+
+    // Don't render if video is disabled (CGA mode reg bit 3 = 0).
+    // Keep video_dirty set so we re-render when video is re-enabled.
+    if (!(s_i86.hw.cga.mode_reg & 0x08)) return;
+
     s_i86.video_dirty = false;
 
-    // Render CGA text mode to GPU back buffer via pc_hw_render_text()
     // video memory starts at offset 0x18000 from video base (B8000h - A0000h)
     uint8_t *video = i86_cpu_get_video();
     if (!video) return;
 
+    // Sync CGA cursor from BIOS state (for software that uses INT 10h)
+    // Programs that write CRTC ports directly already update hw.cga.cursor_pos
+    uint16_t bda_cpos = bda_read16(BDA_CURSOR_POS);
+    uint8_t bda_cy = (bda_cpos >> 8) & 0xFF;
+    uint8_t bda_cx = bda_cpos & 0xFF;
+    uint16_t hw_cpos = bda_cy * 80 + bda_cx;
+    // Use BDA position if it differs from hardware (BIOS wrote it)
+    if (hw_cpos != s_i86.hw.cga.cursor_pos && bda_cy < 25 && bda_cx < 80) {
+        s_i86.hw.cga.cursor_pos = hw_cpos;
+    }
+
     s_i86.hw.cga.needs_refresh = true;
-    pc_hw_render_text(&s_i86.hw, video + 0x18000);
+
+    // Diagnostic: log first few LCD refreshes
+    static int lcd_refresh_count = 0;
+    if (lcd_refresh_count < 10) {
+        // Show first 10 chars of VRAM to verify content
+        uint8_t *vram = video + 0x18000;
+        ESP_LOGI(TAG, "LCD refresh #%d: mode=%02X cursor=(%d,%d) vram='%c%c%c%c%c%c%c%c'",
+                 lcd_refresh_count, s_i86.hw.cga.mode_reg,
+                 bda_cx, bda_cy,
+                 (vram[0] >= 0x20 && vram[0] < 0x7F) ? vram[0] : '.',
+                 (vram[2] >= 0x20 && vram[2] < 0x7F) ? vram[2] : '.',
+                 (vram[4] >= 0x20 && vram[4] < 0x7F) ? vram[4] : '.',
+                 (vram[6] >= 0x20 && vram[6] < 0x7F) ? vram[6] : '.',
+                 (vram[8] >= 0x20 && vram[8] < 0x7F) ? vram[8] : '.',
+                 (vram[10] >= 0x20 && vram[10] < 0x7F) ? vram[10] : '.',
+                 (vram[12] >= 0x20 && vram[12] < 0x7F) ? vram[12] : '.',
+                 (vram[14] >= 0x20 && vram[14] < 0x7F) ? vram[14] : '.');
+        lcd_refresh_count++;
+    }
+
+    // Use mode-aware renderer: auto-detects text vs graphics from CGA mode register
+    pc_hw_render_cga(&s_i86.hw, video + 0x18000);
 }
 
 // ============================================================================
@@ -2195,20 +3749,12 @@ esp_err_t i86_init(i86_config_t *config) {
     // Initialize DOS state
     dos_init_state();
 
-    // Initialize keyboard buffer
-    s_i86.bios_kbd_head = 0;
-    s_i86.bios_kbd_tail = 0;
-
     // Video defaults
     s_i86.video_mode = 0x03;
     s_i86.cursor_x = 0;
     s_i86.cursor_y = 0;
     s_i86.text_attr = 0x07;
     s_i86.active_page = 0;
-
-    // Timer
-    s_i86.timer_ticks = 0;
-    s_i86.timer_midnight = false;
 
     s_i86.mutex = xSemaphoreCreateMutex();
     s_i86.state = I86_STATE_STOPPED;
@@ -2283,14 +3829,10 @@ void i86_reset(void) {
     i86_cpu_reset();
     setup_bios();
 
-    s_i86.bios_kbd_head = 0;
-    s_i86.bios_kbd_tail = 0;
     s_i86.video_mode = 0x03;
     s_i86.cursor_x = 0;
     s_i86.cursor_y = 0;
     s_i86.text_attr = 0x07;
-    s_i86.timer_ticks = 0;
-    s_i86.timer_midnight = false;
     s_i86.stop_requested = false;
 
     memset(&s_i86.stats, 0, sizeof(s_i86.stats));
@@ -2303,36 +3845,43 @@ uint32_t i86_run(uint32_t count) {
     s_i86.state = I86_STATE_RUNNING;
     s_i86.stop_requested = false;
 
+    // Ensure video card is in GFX mode for CGA rendering
+    if (video_card_is_initialized() && count == 0) {
+        video_card_enter_gfx_mode();
+    }
+
     uint32_t total_executed = 0;
-    uint32_t batch = 128;  // Execute instructions in batches for efficiency
+    uint32_t batch = 4096;  // Execute instructions in larger batches for speed
     bool continuous = (count == 0);
+    uint32_t poll_counter = 0;
+    int64_t last_yield_us = esp_timer_get_time();
+    uint32_t next_trace = 2000000;  // Next trace threshold
 
     while (continuous || total_executed < count) {
         if (s_i86.stop_requested) break;
         if (s_i86.state != I86_STATE_RUNNING) break;
 
-        // Diagnostic: trace CS:IP for first instructions and periodically
-        uint32_t effective_batch = batch;
-        if (total_executed < 50) {
-            effective_batch = 1;  // Single-step for detailed trace
+        // Periodic trace (every 2M instructions)
+        if (total_executed >= next_trace) {
             uint16_t cs = i86_cpu_get_cs();
             uint16_t ip = i86_cpu_get_ip();
-            uint8_t *mem = i86_cpu_get_memory();
-            uint32_t phys = 16 * cs + ip;
-            ESP_LOGI(TAG, "TRACE [%lu] %04X:%04X phys=%05X op=%02X %02X %02X %02X halted=%d",
-                     (unsigned long)total_executed, cs, ip, phys,
-                     mem[phys], mem[phys+1], mem[phys+2], mem[phys+3],
-                     i86_cpu_is_halted());
-        } else if (total_executed % 50000 == 0) {
-            uint16_t cs = i86_cpu_get_cs();
-            uint16_t ip = i86_cpu_get_ip();
-            ESP_LOGI(TAG, "TRACE [%lu] %04X:%04X halted=%d",
-                     (unsigned long)total_executed, cs, ip, i86_cpu_is_halted());
+            uint16_t ax = i86_cpu_get_ax();
+            uint16_t flags = i86_cpu_get_flags();
+            {
+                uint8_t *mem = i86_cpu_get_memory();
+                uint32_t phys = ((uint32_t)cs * 16 + ip) & 0xFFFFF;
+                ESP_LOGI(TAG, "[%luM] %04X:%04X AX=%04X FL=%04X  INT: 08=%lu 10=%lu 13=%lu 21=%lu  [%02X %02X %02X %02X %02X]",
+                         (unsigned long)(total_executed / 1000000), cs, ip, ax, flags,
+                         (unsigned long)s_int08_count, (unsigned long)s_int10_count,
+                         (unsigned long)s_int13_count, (unsigned long)s_int21_count,
+                         mem[phys], mem[phys+1], mem[phys+2], mem[phys+3], mem[phys+4]);
+            }
+            next_trace += 2000000;
         }
 
         // Execute a batch of instructions
-        uint32_t to_run = effective_batch;
-        if (!continuous && (count - total_executed) < effective_batch) {
+        uint32_t to_run = batch;
+        if (!continuous && (count - total_executed) < batch) {
             to_run = count - total_executed;
         }
 
@@ -2340,38 +3889,29 @@ uint32_t i86_run(uint32_t count) {
         total_executed += executed;
         s_i86.stats.instructions_executed += executed;
 
-        // After the MOVSW (instruction ~11), verify the relocation copy
-        if (total_executed == 11 || total_executed == 12) {
-            uint8_t *mem = i86_cpu_get_memory();
-            ESP_LOGI(TAG, "VERIFY[%lu] src@7C00=%02X%02X%02X%02X src@7C22=%02X%02X%02X%02X",
-                     (unsigned long)total_executed,
-                     mem[0x7C00], mem[0x7C01], mem[0x7C02], mem[0x7C03],
-                     mem[0x7C22], mem[0x7C23], mem[0x7C24], mem[0x7C25]);
-            ESP_LOGI(TAG, "VERIFY[%lu] dst@27A00=%02X%02X%02X%02X dst@27A22=%02X%02X%02X%02X",
-                     (unsigned long)total_executed,
-                     mem[0x27A00], mem[0x27A01], mem[0x27A02], mem[0x27A03],
-                     mem[0x27A22], mem[0x27A23], mem[0x27A24], mem[0x27A25]);
-            ESP_LOGI(TAG, "VERIFY[%lu] ES=%04X DI=%04X SI=%04X CX=%04X DS=%04X",
-                     (unsigned long)total_executed,
-                     i86_cpu_get_es(), i86_cpu_get_di(), i86_cpu_get_si(),
-                     i86_cpu_get_cx(), i86_cpu_get_ds());
-        }
-
         // Tick PC hardware (PIT, PIC, keyboard)
         int irq_vector = pc_hw_tick(&s_i86.hw, executed);
         if (irq_vector >= 0) {
             i86_cpu_irq(irq_vector);
         }
 
-        // Poll input every batch
-        poll_input();
+        poll_counter++;
 
-        // Refresh LCD periodically
-        refresh_lcd();
+        // Poll input every ~16K instructions (every 4 batches)
+        if ((poll_counter & 3) == 0) {
+            poll_input();
+        }
 
-        // Yield to FreeRTOS every few batches
-        if (total_executed % 1024 == 0) {
-            vTaskDelay(1);  // Minimal yield
+        // Refresh LCD every ~32K instructions (every 8 batches)
+        if ((poll_counter & 7) == 0) {
+            refresh_lcd();
+        }
+
+        // Yield to FreeRTOS based on elapsed time (~10ms intervals)
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_yield_us > 10000) {  // 10ms
+            vTaskDelay(1);
+            last_yield_us = esp_timer_get_time();
         }
 
         if (i86_cpu_is_halted()) {
@@ -2389,6 +3929,10 @@ uint32_t i86_run(uint32_t count) {
         }
     }
 
+    // Log why execution stopped
+    ESP_LOGI(TAG, "Execution loop exited: %lu instructions, halted=%d, state=%d, stop=%d",
+             (unsigned long)total_executed, i86_cpu_is_halted(), s_i86.state, s_i86.stop_requested);
+
     if (i86_cpu_is_halted() && s_i86.state == I86_STATE_RUNNING) {
         s_i86.state = I86_STATE_HALTED;
     }
@@ -2405,6 +3949,7 @@ void i86_boot_and_run(void) {
     // Reset and boot
     i86_reset();
 
+    // Print boot info to console BEFORE switching to GFX mode
     console_printf("=== IBM PC/XT Emulator ===\n");
     console_printf("CPU: Intel 8086 @ %lu MHz\n", (unsigned long)s_i86.config.cpu_freq_mhz);
     console_printf("RAM: 640 KB\n");
@@ -2415,11 +3960,20 @@ void i86_boot_and_run(void) {
     disk_list(disk_buf, sizeof(disk_buf));
     console_printf("%s\n", disk_buf);
 
+    // NOW switch video card to GFX mode for direct CGA rendering to LCD
+    // This must happen AFTER all console_printf() calls, because console_printf
+    // auto-switches back to TEXT mode.
+    if (video_card_is_initialized()) {
+        video_card_enter_gfx_mode();
+        video_card_present();  // Show initial black frame
+    }
+
     // Start running - this will invoke INT 19h via BIOS reset vector
     s_i86.state = I86_STATE_RUNNING;
     i86_run(0);  // Run until stopped
 
-    console_printf("\ni8086 emulator stopped.\n");
+    // Emulator stopped - switch back to text mode for console output
+    printf("\ni8086 emulator stopped.\n");
 }
 
 esp_err_t i86_step(void) {
@@ -2512,7 +4066,7 @@ void i86_get_state_string(char *buffer, size_t size) {
              s_i86.stats.disk_reads,
              s_i86.stats.disk_writes,
              s_i86.stats.files_opened,
-             s_i86.timer_ticks);
+             (uint32_t)(bda_read16(BDA_TIMER_COUNT) | ((uint32_t)bda_read16(BDA_TIMER_COUNT + 2) << 16)));
 }
 
 void i86_dump_memory(uint32_t addr, uint32_t length) {
@@ -2562,12 +4116,8 @@ void i86_send_key(uint8_t scancode, uint8_t ascii) {
     // Push to keyboard controller hardware
     kbd_push_scancode(&s_i86.hw.keyboard, scancode);
 
-    // Also add to BIOS keyboard buffer directly
-    int next = (s_i86.bios_kbd_head + 1) % 16;
-    if (next != s_i86.bios_kbd_tail) {
-        s_i86.bios_kbd_buffer[s_i86.bios_kbd_head] = (scancode << 8) | ascii;
-        s_i86.bios_kbd_head = next;
-    }
+    // Also add to BDA keyboard buffer directly
+    bda_kbd_push((scancode << 8) | ascii);
 }
 
 void i86_send_scancode(uint8_t scancode) {
